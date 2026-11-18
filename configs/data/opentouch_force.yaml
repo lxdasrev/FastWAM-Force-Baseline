@@ -1,0 +1,45 @@
+train:
+  _target_: fastwam.datasets.opentouch.OpenTouchForceDataset
+  raw_data_root: //wsl$/Ubuntu2204/home/lxd/code/embodyaicode/opentouch/opentouch-main/data
+  cache_root: ./data/opentouch_fastwam_cache
+  split: train
+  split_seed: 42
+  split_ratios: [0.8, 0.1, 0.1]
+  video_size: [224, 224]
+  history_steps: 16
+  future_steps: 32
+  video_stride: 4
+  pressure_baseline: 3072.0
+  force_deadzone: 0.0
+  force_asinh_scale: 256.0
+  force_clip: 5.0
+  workspace_scale_m: 0.30
+  smoothing_window: 5
+  max_delta_translation_m: 0.05
+  max_delta_rotation_rad: 0.50
+  compute_force_stats: true
+  normalize_action_proprio: true
+  strict_schema: true
+
+val:
+  _target_: fastwam.datasets.opentouch.OpenTouchForceDataset
+  raw_data_root: ${data.train.raw_data_root}
+  cache_root: ${data.train.cache_root}
+  split: val
+  split_seed: ${data.train.split_seed}
+  split_ratios: ${data.train.split_ratios}
+  video_size: ${data.train.video_size}
+  history_steps: ${data.train.history_steps}
+  future_steps: ${data.train.future_steps}
+  video_stride: ${data.train.video_stride}
+  pressure_baseline: ${data.train.pressure_baseline}
+  force_deadzone: ${data.train.force_deadzone}
+  force_asinh_scale: ${data.train.force_asinh_scale}
+  force_clip: ${data.train.force_clip}
+  workspace_scale_m: ${data.train.workspace_scale_m}
+  smoothing_window: ${data.train.smoothing_window}
+  max_delta_translation_m: ${data.train.max_delta_translation_m}
+  max_delta_rotation_rad: ${data.train.max_delta_rotation_rad}
+  compute_force_stats: true
+  normalize_action_proprio: true
+  strict_schema: true
