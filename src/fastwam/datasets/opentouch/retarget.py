@@ -89,7 +89,13 @@ def retarget_hand_sequence(
     gripper_closed_ratio: float = 0.18,
     gripper_open_ratio: float = 1.35,
 ) -> dict[str, np.ndarray]:
-    """Create 7D task-space deltas and 8D task-space pseudo-proprio."""
+    """Create canonical-frame action chunks and task-space pseudo-proprio.
+
+    The first valid palm pose defines the canonical frame.  Proprio is the
+    absolute palm pose in that frame.  Action dimensions 0:6 are canonical
+    translation/rotation deltas, while dimension 6 is the *absolute* next
+    gripper target (and therefore must not be described as a delta).
+    """
     landmarks = np.asarray(landmarks, dtype=np.float64)
     if landmarks.ndim != 3 or landmarks.shape[1:] != (21, 3):
         raise ValueError(f"Expected landmarks [T,21,3], got {landmarks.shape}")
@@ -148,8 +154,11 @@ def retarget_hand_sequence(
     for i in range(frames - 1):
         if not (valid[i] and valid[i + 1]):
             continue
-        delta_position = rotations[i].T @ (position[i + 1] - position[i]) / scale * workspace_scale_m
-        delta_rotation = rotations[i].T @ rotations[i + 1]
+        # Spatial deltas expressed in the fixed canonical frame.  This keeps
+        # action and proprio in one coordinate frame instead of mixing
+        # canonical proprio with a moving body-frame action representation.
+        delta_position = base_rotation.T @ (position[i + 1] - position[i]) / scale * workspace_scale_m
+        delta_rotation = task_rotation[i + 1] @ task_rotation[i].T
         value = np.concatenate([delta_position, _matrix_to_rotvec(delta_rotation), [gripper[i + 1]]])
         if np.isfinite(value).all():
             action[i] = value.astype(np.float32)

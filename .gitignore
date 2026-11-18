@@ -15,8 +15,6 @@ evaluate_results/
 .deepspeed*
 
 volc/
-tests/
-
 # ai coding
 .codex/
 .claude/

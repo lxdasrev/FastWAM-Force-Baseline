@@ -14,6 +14,19 @@ is_integer() {
   [[ "${1}" =~ ^[0-9]+$ ]]
 }
 
+if ! is_integer "${NPROC_PER_NODE}" || (( NPROC_PER_NODE < 1 )); then
+  echo "Error: nproc_per_node (${NPROC_PER_NODE}) must be a positive integer." >&2
+  exit 1
+fi
+
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  IFS=',' read -r -a VISIBLE_CUDA_DEVICES <<< "${CUDA_VISIBLE_DEVICES}"
+  if (( ${#VISIBLE_CUDA_DEVICES[@]} != NPROC_PER_NODE )); then
+    echo "Error: CUDA_VISIBLE_DEVICES exposes ${#VISIBLE_CUDA_DEVICES[@]} GPU(s), but nproc_per_node=${NPROC_PER_NODE}." >&2
+    exit 1
+  fi
+fi
+
 if ! is_integer "${NUM_MACHINES}" || ! is_integer "${MACHINE_RANK}"; then
   echo "Error: NUM_MACHINES (${NUM_MACHINES}) and MACHINE_RANK (${MACHINE_RANK}) must be integers." >&2
   exit 1

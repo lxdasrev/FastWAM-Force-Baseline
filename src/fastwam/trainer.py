@@ -3,6 +3,7 @@ import json
 import inspect
 import os
 import re
+import shutil
 from math import ceil
 from pathlib import Path
 import time
@@ -16,6 +17,7 @@ from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, Se
 from torch.utils.data import DataLoader
 
 from .datasets.opentouch.metrics import compute_opentouch_inference_metrics
+from .datasets.opentouch.contract import artifact_hashes
 from .utils.fs import ensure_dir
 from .utils.logging_config import get_logger, setup_logging
 from .utils.pytorch_utils import set_global_seed
@@ -50,6 +52,13 @@ class Wan22Trainer:
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
         self.max_grad_norm = float(cfg.max_grad_norm)
         self.seed = int(cfg.seed)
+        self.force_warmup_steps = int(cfg.get("force_warmup_steps", 0))
+        self.train_video_expert = bool(cfg.get("train_video_expert", True))
+        self.allow_data_contract_mismatch = bool(
+            cfg.get("allow_data_contract_mismatch", False)
+        )
+        self.force_ablation_every = int(cfg.get("force_ablation_every", 2000))
+        self._active_training_stage = None
         
         self.resume = cfg.resume
         self.mixed_precision = str(cfg.mixed_precision).strip().lower()
@@ -92,11 +101,17 @@ class Wan22Trainer:
 
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # This keeps DiT (+ optional proprio encoder) as trainable when ZeRO builds optimizer state.
-        self._apply_dit_only_train_mode(self.model)
-        trainable_params = list(self.model.dit.parameters())
+        self._apply_dit_only_train_mode(
+            self.model,
+            train_video_expert=self.train_video_expert,
+            force_warmup=False,
+        )
+        trainable_params = [param for param in self.model.dit.parameters() if param.requires_grad]
         proprio_encoder = getattr(self.model, "proprio_encoder", None)
         if proprio_encoder is not None:
-            trainable_params.extend(list(proprio_encoder.parameters()))
+            trainable_params.extend(
+                param for param in proprio_encoder.parameters() if param.requires_grad
+            )
         force_expert = getattr(self.model, "force_expert", None)
         new_param_ids = set()
         if force_expert is not None:
@@ -151,6 +166,18 @@ class Wan22Trainer:
         ensure_dir(self.weights_dir)
         ensure_dir(self.state_dir)
         ensure_dir(self.eval_dir)
+
+        self.run_data_artifact_dir = os.path.join(self.output_dir, "data_artifacts")
+        if hasattr(self.train_dataset, "export_data_artifacts"):
+            if self.accelerator.is_main_process:
+                self.data_artifact_hashes = self.train_dataset.export_data_artifacts(
+                    self.run_data_artifact_dir
+                )
+            self.accelerator.wait_for_everyone()
+            self.train_dataset.validate_data_artifacts(self.run_data_artifact_dir)
+            self.data_artifact_hashes = artifact_hashes(self.run_data_artifact_dir)
+        else:
+            self.data_artifact_hashes = None
 
         if bool(getattr(self.model, "compile_training_denoise", False)):
             logger.info("Compiling training denoise forward/backward before DeepSpeed initialization.")
@@ -332,17 +359,60 @@ class Wan22Trainer:
         if not resume_path.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume}")
         logger.info("Loading weight checkpoint only: %s", resume)
-        self.accelerator.unwrap_model(self.model).load_checkpoint(str(resume_path), optimizer=None)
+        checkpoint_artifact_dir = resume_path.with_suffix("")
+        self._validate_checkpoint_artifacts(checkpoint_artifact_dir)
+        self.accelerator.unwrap_model(self.model).load_checkpoint(
+            str(resume_path),
+            optimizer=None,
+            data_artifact_dir=str(checkpoint_artifact_dir),
+        )
         logger.warning("Loaded .pt weights only; optimizer/scheduler/step were not restored under ZeRO2.")
 
+    def _validate_checkpoint_artifacts(self, artifact_dir: str | Path) -> None:
+        if not hasattr(self.train_dataset, "validate_data_artifacts"):
+            return
+        try:
+            self.train_dataset.validate_data_artifacts(artifact_dir)
+        except (FileNotFoundError, ValueError) as error:
+            if self.allow_data_contract_mismatch:
+                logger.warning(
+                    "Ignoring checkpoint/data contract mismatch because "
+                    "allow_data_contract_mismatch=true: %s",
+                    error,
+                )
+                return
+            raise
+
     def _set_dit_only_train_mode(self):
-        # Match DiffSynth's freeze_except("dit"): only DiT stays trainable/in-train-mode.
-        logger.info("Setting DiT to train mode and freezing other model components.")
         model = self.accelerator.unwrap_model(self.model)
-        self._apply_dit_only_train_mode(model)
+        force_warmup = bool(
+            getattr(model, "force_expert", None) is not None
+            and self.global_step < self.force_warmup_steps
+        )
+        stage = "force_warmup" if force_warmup else "joint"
+        if stage == self._active_training_stage and model.dit.training:
+            return
+        if stage != self._active_training_stage:
+            logger.info(
+                "Setting training stage=%s train_video_expert=%s at step=%d",
+                stage,
+                self.train_video_expert,
+                self.global_step,
+            )
+            self._active_training_stage = stage
+        self._apply_dit_only_train_mode(
+            model,
+            train_video_expert=self.train_video_expert,
+            force_warmup=force_warmup,
+        )
 
     @staticmethod
-    def _apply_dit_only_train_mode(model):
+    def _apply_dit_only_train_mode(
+        model,
+        *,
+        train_video_expert: bool = True,
+        force_warmup: bool = False,
+    ):
         model.eval()
         model.requires_grad_(False)
         model.dit.train()
@@ -351,6 +421,22 @@ class Wan22Trainer:
         if proprio_encoder is not None:
             proprio_encoder.train()
             proprio_encoder.requires_grad_(True)
+        if not train_video_expert or force_warmup:
+            model.video_expert.eval()
+            model.video_expert.requires_grad_(False)
+        if force_warmup:
+            model.action_expert.eval()
+            model.action_expert.requires_grad_(False)
+            if proprio_encoder is not None:
+                proprio_encoder.eval()
+                proprio_encoder.requires_grad_(False)
+            force_va_gates = getattr(model.mot, "force_va_gates", None)
+            if force_va_gates is not None:
+                force_va_gates.requires_grad_(False)
+            force_expert = getattr(model, "force_expert", None)
+            if force_expert is not None:
+                force_expert.train()
+                force_expert.requires_grad_(True)
 
     @staticmethod
     def _to_batched_eval_sample(sample):
@@ -486,10 +572,20 @@ class Wan22Trainer:
         observed_steps = int(model.force_expert.observed_steps)
         gt_force_norm = force[observed_steps:]
         force_history = force[:observed_steps]
+        history_valid = sample.get("force_valid")
+        if history_valid is None:
+            history_valid = torch.ones_like(force_history, dtype=torch.bool)
+        else:
+            history_valid = history_valid[0, :observed_steps]
+        history_is_pad = sample.get("force_is_pad")
+        if history_is_pad is not None:
+            history_is_pad = history_is_pad[0, :observed_steps]
 
         infer_kwargs = {
             "input_image": video0[:, 0],
             "force_history": force_history,
+            "force_history_valid": history_valid,
+            "force_history_is_pad": history_is_pad,
             "action_horizon": int(gt_action_norm.shape[0]),
             "proprio": proprio,
             "num_inference_steps": self.eval_num_inference_steps,
@@ -539,15 +635,100 @@ class Wan22Trainer:
             gt_force=gt_force,
             force_valid=force_valid,
         )
+        run_ablations = bool(
+            self.force_ablation_every > 0
+            and self.global_step % self.force_ablation_every == 0
+        )
+        ablation_step_gains: dict[str, np.ndarray] = {}
+        if run_ablations:
+            variants = {
+                "zero": {
+                    **infer_kwargs,
+                    "force_history": torch.zeros_like(force_history),
+                }
+            }
+            permutation = torch.randperm(
+                observed_steps,
+                generator=torch.Generator(device="cpu").manual_seed(
+                    self.seed + eval_index + 17
+                ),
+            )
+            variants["time_shuffled"] = {
+                **infer_kwargs,
+                "force_history": force_history[permutation],
+                "force_history_valid": history_valid[permutation],
+                "force_history_is_pad": (
+                    None if history_is_pad is None else history_is_pad[permutation]
+                ),
+            }
+            shuffled_index = (eval_index + max(1, len(self.val_dataset) // 2)) % len(
+                self.val_dataset
+            )
+            if hasattr(self.val_dataset, "find_contact_window"):
+                shuffled_index = self.val_dataset.find_contact_window(shuffled_index)
+            shuffled_sample = self.val_dataset[shuffled_index]
+            shuffled_force = shuffled_sample["force"][:observed_steps]
+            shuffled_valid = shuffled_sample.get(
+                "force_valid", torch.ones_like(shuffled_force, dtype=torch.bool)
+            )[:observed_steps]
+            shuffled_pad = shuffled_sample.get("force_is_pad")
+            if shuffled_pad is not None:
+                shuffled_pad = shuffled_pad[:observed_steps]
+            variants["shuffled"] = {
+                **infer_kwargs,
+                "force_history": shuffled_force,
+                "force_history_valid": shuffled_valid,
+                "force_history_is_pad": shuffled_pad,
+            }
+
+            action_mask = np.broadcast_to(action_valid[:, None], gt_action.shape)
+            correct_sq = np.square(pred_action - gt_action)
+            correct_step_mse = correct_sq.mean(axis=1)
+            correct_mse = float(correct_sq[action_mask].mean()) if action_mask.any() else float("nan")
+            local_metrics["ablation_action_mse_correct"] = correct_mse
+            for name, variant_kwargs in variants.items():
+                with self.accelerator.autocast():
+                    variant_pred = model.infer_action_force(**variant_kwargs)
+                variant_action = self.val_dataset.denormalize_action(
+                    variant_pred["action"].detach().cpu().numpy()
+                )
+                variant_sq = np.square(variant_action - gt_action)
+                variant_step_mse = variant_sq.mean(axis=1)
+                variant_mse = (
+                    float(variant_sq[action_mask].mean())
+                    if action_mask.any()
+                    else float("nan")
+                )
+                local_metrics[f"ablation_action_mse_{name}"] = variant_mse
+                local_metrics[f"ablation_relative_gain_vs_{name}"] = (
+                    (variant_mse - correct_mse) / max(variant_mse, 1e-12)
+                )
+                step_gain = (variant_step_mse - correct_step_mse) / np.maximum(
+                    variant_step_mse, 1e-12
+                )
+                step_gain[~action_valid] = np.nan
+                ablation_step_gains[name] = step_gain.astype(np.float32)
         local_metrics["val_loss"] = float(val_loss)
-        for key in ("loss_video", "loss_action", "loss_force"):
+        for key in (
+            "loss_video",
+            "loss_action",
+            "raw_force_loss",
+            "scheduler_weighted_force_loss",
+            "loss_force",
+            "force_valid_fraction",
+            "force_valid_samples",
+        ):
             local_metrics[f"val_{key}"] = float(val_loss_dict.get(key, float("nan")))
 
         metric_names = [
             "val_loss",
             "val_loss_video",
             "val_loss_action",
+            "val_raw_force_loss",
+            "val_scheduler_weighted_force_loss",
             "val_loss_force",
+            "val_force_valid_fraction",
+            "val_force_valid_samples",
             "action_mae",
             "action_rmse",
             "action_translation_mae_m",
@@ -558,6 +739,18 @@ class Wan22Trainer:
             "force_thumb_mae",
             "force_index_mae",
         ]
+        if run_ablations:
+            metric_names.extend(
+                [
+                    "ablation_action_mse_correct",
+                    "ablation_action_mse_zero",
+                    "ablation_action_mse_shuffled",
+                    "ablation_action_mse_time_shuffled",
+                    "ablation_relative_gain_vs_zero",
+                    "ablation_relative_gain_vs_shuffled",
+                    "ablation_relative_gain_vs_time_shuffled",
+                ]
+            )
         local_tensor = torch.tensor(
             [local_metrics[name] for name in metric_names],
             device=self.accelerator.device,
@@ -568,6 +761,47 @@ class Wan22Trainer:
         result: dict[str, float | str] = {
             name: float(value) for name, value in zip(metric_names, mean_values)
         }
+        if run_ablations:
+            for variant_name in ("zero", "shuffled", "time_shuffled"):
+                metric_name = f"ablation_relative_gain_vs_{variant_name}"
+                step_tensor = torch.as_tensor(
+                    ablation_step_gains[variant_name],
+                    device=self.accelerator.device,
+                    dtype=torch.float32,
+                ).unsqueeze(0)
+                samples = (
+                    self.accelerator.gather_for_metrics(step_tensor)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .reshape(-1)
+                )
+                samples = samples[np.isfinite(samples)]
+                if samples.size:
+                    rng = np.random.default_rng(self.seed + self.global_step)
+                    bootstrap = rng.choice(
+                        samples,
+                        size=(1000, samples.size),
+                        replace=True,
+                    ).mean(axis=1)
+                    result[f"{metric_name}_ci95_low"] = float(
+                        np.quantile(bootstrap, 0.025)
+                    )
+                    result[f"{metric_name}_ci95_high"] = float(
+                        np.quantile(bootstrap, 0.975)
+                    )
+            shuffled_gain = result.get(
+                "ablation_relative_gain_vs_shuffled", float("nan")
+            )
+            shuffled_ci_low = result.get(
+                "ablation_relative_gain_vs_shuffled_ci95_low", float("nan")
+            )
+            result["force_usage_pass"] = float(
+                np.isfinite(shuffled_gain)
+                and np.isfinite(shuffled_ci_low)
+                and shuffled_gain >= 0.02
+                and shuffled_ci_low > 0.0
+            )
         result["eval_mode"] = "opentouch_action_force"
 
         if self.accelerator.is_main_process:
@@ -609,9 +843,11 @@ class Wan22Trainer:
         was_dit_training = model.dit.training
         model.eval()
 
-        # eval_index = (self.global_step + self.accelerator.process_index) % len(self.val_dataset)
-        rng = torch.Generator(device="cpu").manual_seed(self.global_step + self.accelerator.process_index)
-        eval_index = torch.randint(0, len(self.val_dataset), (1,), generator=rng).item()
+        # Each rank owns one stable validation window.  The set no longer
+        # changes with global_step, so model comparisons use identical data.
+        eval_index = (self.seed + self.accelerator.process_index) % len(self.val_dataset)
+        if hasattr(self.val_dataset, "find_contact_window"):
+            eval_index = self.val_dataset.find_contact_window(eval_index)
         sample = self._to_batched_eval_sample(self.val_dataset[eval_index])
 
         # 1. training loss
@@ -620,6 +856,52 @@ class Wan22Trainer:
             val_loss = val_loss.float().item()
 
         if self._is_opentouch_force_eval(model, sample):
+            run_generation = bool(
+                self.force_ablation_every > 0
+                and self.global_step % self.force_ablation_every == 0
+            )
+            if not run_generation:
+                metric_names = [
+                    "val_loss",
+                    "val_loss_video",
+                    "val_loss_action",
+                    "val_raw_force_loss",
+                    "val_scheduler_weighted_force_loss",
+                    "val_loss_force",
+                    "val_force_valid_fraction",
+                    "val_force_valid_samples",
+                ]
+                local_values = [
+                    val_loss,
+                    float(val_loss_dict.get("loss_video", float("nan"))),
+                    float(val_loss_dict.get("loss_action", float("nan"))),
+                    float(val_loss_dict.get("raw_force_loss", float("nan"))),
+                    float(
+                        val_loss_dict.get(
+                            "scheduler_weighted_force_loss", float("nan")
+                        )
+                    ),
+                    float(val_loss_dict.get("loss_force", float("nan"))),
+                    float(
+                        val_loss_dict.get("force_valid_fraction", float("nan"))
+                    ),
+                    float(val_loss_dict.get("force_valid_samples", float("nan"))),
+                ]
+                gathered = self.accelerator.gather_for_metrics(
+                    torch.tensor(
+                        local_values,
+                        device=self.accelerator.device,
+                        dtype=torch.float32,
+                    ).unsqueeze(0)
+                )
+                means = torch.nanmean(gathered, dim=0).cpu().tolist()
+                result = {
+                    name: float(value) for name, value in zip(metric_names, means)
+                }
+                result["eval_mode"] = "opentouch_loss_only"
+                if was_dit_training:
+                    self._set_dit_only_train_mode()
+                return result
             return self._evaluate_opentouch_force(
                 model=model,
                 sample=sample,
@@ -804,8 +1086,29 @@ class Wan22Trainer:
     def _save_weights_checkpoint(self, step_tag: str):
         model = self.accelerator.unwrap_model(self.model)
         ckpt_path = os.path.join(self.weights_dir, f"{step_tag}.pt")
-        model.save_checkpoint(ckpt_path, optimizer=None, step=self.global_step)
+        checkpoint_artifact_dir = os.path.join(self.weights_dir, step_tag)
+        checkpoint_artifact_hashes = self._copy_data_artifacts(checkpoint_artifact_dir)
+        model.save_checkpoint(
+            ckpt_path,
+            optimizer=None,
+            step=self.global_step,
+            data_artifact_hashes=checkpoint_artifact_hashes,
+        )
         return ckpt_path
+
+    def _copy_data_artifacts(self, destination: str | Path):
+        if self.data_artifact_hashes is None:
+            return None
+        destination = Path(destination)
+        destination.mkdir(parents=True, exist_ok=True)
+        for filename in self.data_artifact_hashes:
+            shutil.copy2(Path(self.run_data_artifact_dir) / filename, destination / filename)
+        copied_hashes = artifact_hashes(destination)
+        if copied_hashes != self.data_artifact_hashes:
+            raise ValueError(
+                f"Copied data artifact hashes differ: {copied_hashes} != {self.data_artifact_hashes}"
+            )
+        return copied_hashes
 
     def _save_trainer_state(self, state_path: str):
         state_file = os.path.join(state_path, "trainer_state.json")
@@ -813,6 +1116,7 @@ class Wan22Trainer:
             "global_step": int(self.global_step),
             "epoch": int(self.epoch),
             "batch_in_epoch": int(self.batch_in_epoch),
+            "data_artifact_hashes": self.data_artifact_hashes,
         }
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
@@ -828,6 +1132,9 @@ class Wan22Trainer:
 
         state_path = os.path.join(self.state_dir, step_tag)
         ensure_dir(state_path)
+        if self.accelerator.is_main_process:
+            self._copy_data_artifacts(state_path)
+        self.accelerator.wait_for_everyone()
         self.accelerator.save_state(output_dir=state_path)
         if self.accelerator.is_main_process:
             self._save_trainer_state(state_path)
@@ -836,12 +1143,20 @@ class Wan22Trainer:
         return {"weights_path": ckpt_path, "state_path": state_path}
 
     def load_training_state(self, state_dir: str):
+        self._validate_checkpoint_artifacts(state_dir)
         self.accelerator.load_state(input_dir=state_dir)
         state_file = Path(state_dir) / "trainer_state.json"
         if state_file.exists():
             with open(state_file, "r", encoding="utf-8") as f:
                 payload = json.load(f)
             self.global_step = int(payload["global_step"])
+            expected_hashes = payload.get("data_artifact_hashes")
+            if expected_hashes is not None:
+                actual_hashes = artifact_hashes(state_dir)
+                if actual_hashes != expected_hashes:
+                    raise ValueError(
+                        f"Training-state data artifact hashes differ: {actual_hashes} != {expected_hashes}"
+                    )
 
             if "epoch" in payload and "batch_in_epoch" in payload:
                 self.epoch = int(payload["epoch"])
@@ -894,6 +1209,8 @@ class Wan22Trainer:
         self.run_start_time = time.perf_counter()
 
         while self.global_step < self.max_steps:
+            # This is a no-op except at the Force-warmup -> joint boundary.
+            self._set_dit_only_train_mode()
             try:
                 sample = next(data_iter)
                 self.batch_in_epoch += 1
@@ -912,6 +1229,15 @@ class Wan22Trainer:
                 self.accelerator.backward(loss)
 
                 if self.accelerator.sync_gradients:
+                    gate_grad_metrics = {}
+                    unwrapped_for_grads = self.accelerator.unwrap_model(self.model)
+                    force_va_gates = getattr(unwrapped_for_grads.mot, "force_va_gates", None)
+                    if force_va_gates is not None:
+                        for layer, parameter in force_va_gates.items():
+                            grad = parameter.grad
+                            gate_grad_metrics[f"force_gate_grad_{layer}"] = (
+                                0.0 if grad is None else float(grad.detach().float().abs().item())
+                            )
                     grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                     if not self.accelerator.optimizer_step_was_skipped:
@@ -924,6 +1250,13 @@ class Wan22Trainer:
                     global_loss_metrics = {}
                     for key, value in loss_dict.items():
                         metric_tensor = torch.tensor(float(value), device=loss.device, dtype=torch.float32).reshape(1)
+                        global_loss_metrics[key] = float(
+                            self.accelerator.gather(metric_tensor).mean().item()
+                        )
+                    for key, value in gate_grad_metrics.items():
+                        metric_tensor = torch.tensor(
+                            value, device=loss.device, dtype=torch.float32
+                        ).reshape(1)
                         global_loss_metrics[key] = float(
                             self.accelerator.gather(metric_tensor).mean().item()
                         )
@@ -970,37 +1303,81 @@ class Wan22Trainer:
                         metrics = self.evaluate()
                         self.accelerator.wait_for_everyone()
                         if metrics is not None and self.accelerator.is_main_process:
-                            if metrics.get("eval_mode") == "opentouch_action_force":
-                                description = (
-                                    "[eval-opentouch] step=%d val_loss=%.4f "
-                                    "action_mae=%.6f action_rmse=%.6f "
-                                    "translation_mae_m=%.6f rotation_mae_rad=%.6f gripper_mae=%.6f "
-                                    "force_mae=%.4f force_rmse=%.4f thumb_mae=%.4f index_mae=%.4f"
-                                ) % (
-                                    self.global_step,
-                                    metrics["val_loss"],
-                                    metrics["action_mae"],
-                                    metrics["action_rmse"],
-                                    metrics["action_translation_mae_m"],
-                                    metrics["action_rotation_mae_rad"],
-                                    metrics["action_gripper_mae"],
-                                    metrics["force_mae"],
-                                    metrics["force_rmse"],
-                                    metrics["force_thumb_mae"],
-                                    metrics["force_index_mae"],
-                                )
-                                logger.info(description)
-                                logger.info(
-                                    "[eval-opentouch-loss] video=%.4f action=%.4f force=%.4f (force value already includes lambda_force)",
-                                    metrics["val_loss_video"],
-                                    metrics["val_loss_action"],
-                                    metrics["val_loss_force"],
-                                )
-                                eval_payload = {
-                                    f"eval/{key}": float(value)
-                                    for key, value in metrics.items()
-                                    if key != "eval_mode" and isinstance(value, (int, float))
-                                }
+                            if metrics.get("eval_mode") in {
+                                "opentouch_action_force",
+                                "opentouch_loss_only",
+                            }:
+                                if metrics.get("eval_mode") == "opentouch_loss_only":
+                                    logger.info(
+                                        "[eval-opentouch-loss-only] step=%d val_loss=%.4f video=%.4f action=%.4f force_raw=%.4f force_scheduler_weighted=%.4f force_final=%.4f valid_fraction=%.4f valid_samples=%.1f",
+                                        self.global_step,
+                                        metrics["val_loss"],
+                                        metrics["val_loss_video"],
+                                        metrics["val_loss_action"],
+                                        metrics["val_raw_force_loss"],
+                                        metrics["val_scheduler_weighted_force_loss"],
+                                        metrics["val_loss_force"],
+                                        metrics["val_force_valid_fraction"],
+                                        metrics["val_force_valid_samples"],
+                                    )
+                                    eval_payload = {
+                                        f"eval/{key}": float(value)
+                                        for key, value in metrics.items()
+                                        if key != "eval_mode"
+                                        and isinstance(value, (int, float))
+                                    }
+                                else:
+                                    description = (
+                                        "[eval-opentouch] step=%d val_loss=%.4f "
+                                        "action_mae=%.6f action_rmse=%.6f "
+                                        "translation_mae_m=%.6f rotation_mae_rad=%.6f gripper_mae=%.6f "
+                                        "force_mae=%.4f force_rmse=%.4f thumb_mae=%.4f index_mae=%.4f"
+                                    ) % (
+                                        self.global_step,
+                                        metrics["val_loss"],
+                                        metrics["action_mae"],
+                                        metrics["action_rmse"],
+                                        metrics["action_translation_mae_m"],
+                                        metrics["action_rotation_mae_rad"],
+                                        metrics["action_gripper_mae"],
+                                        metrics["force_mae"],
+                                        metrics["force_rmse"],
+                                        metrics["force_thumb_mae"],
+                                        metrics["force_index_mae"],
+                                    )
+                                    logger.info(description)
+                                    logger.info(
+                                        "[eval-opentouch-loss] video=%.4f action=%.4f force_raw=%.4f force_scheduler_weighted=%.4f force_final=%.4f valid_fraction=%.4f valid_samples=%.1f",
+                                        metrics["val_loss_video"],
+                                        metrics["val_loss_action"],
+                                        metrics["val_raw_force_loss"],
+                                        metrics["val_scheduler_weighted_force_loss"],
+                                        metrics["val_loss_force"],
+                                        metrics["val_force_valid_fraction"],
+                                        metrics["val_force_valid_samples"],
+                                    )
+                                    if "ablation_relative_gain_vs_zero" in metrics:
+                                        logger.info(
+                                            "[eval-force-ablation] gain_vs_zero=%.4f gain_vs_shuffled=%.4f gain_vs_time_shuffled=%.4f shuffled_ci95=[%.4f, %.4f] usage_pass=%s",
+                                            metrics["ablation_relative_gain_vs_zero"],
+                                            metrics["ablation_relative_gain_vs_shuffled"],
+                                            metrics["ablation_relative_gain_vs_time_shuffled"],
+                                            metrics.get(
+                                                "ablation_relative_gain_vs_shuffled_ci95_low",
+                                                float("nan"),
+                                            ),
+                                            metrics.get(
+                                                "ablation_relative_gain_vs_shuffled_ci95_high",
+                                                float("nan"),
+                                            ),
+                                            bool(metrics.get("force_usage_pass", 0.0)),
+                                        )
+                                    eval_payload = {
+                                        f"eval/{key}": float(value)
+                                        for key, value in metrics.items()
+                                        if key != "eval_mode"
+                                        and isinstance(value, (int, float))
+                                    }
                             else:
                                 description = "[eval] step=%d val_loss=%.4f infer_psnr=%.4f infer_ssim=%.4f" % (
                                     self.global_step,

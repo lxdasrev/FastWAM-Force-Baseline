@@ -20,6 +20,9 @@ train:
   compute_force_stats: true
   normalize_action_proprio: true
   strict_schema: true
+  sample_rate_hz: 30.0
+  gripper_closed_ratio: 0.18
+  gripper_open_ratio: 1.35
 
 val:
   _target_: fastwam.datasets.opentouch.OpenTouchForceDataset
@@ -43,3 +46,6 @@ val:
   compute_force_stats: true
   normalize_action_proprio: true
   strict_schema: true
+  sample_rate_hz: ${data.train.sample_rate_hz}
+  gripper_closed_ratio: ${data.train.gripper_closed_ratio}
+  gripper_open_ratio: ${data.train.gripper_open_ratio}

@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from .retarget import retarget_hand_sequence
+from .contract import write_artifacts, verify_artifact_payloads
 
 
 class OpenTouchForceDataset(Dataset):
@@ -25,6 +27,9 @@ class OpenTouchForceDataset(Dataset):
     Numeric retargeting is cached per episode. RGB JPEG frames remain in the
     source HDF5 and are decoded only for the nine frames used by FastWAM.
     """
+
+    PROCESSING_VERSION = 3
+    DATA_CONTRACT_VERSION = 1
 
     def __init__(
         self,
@@ -49,6 +54,9 @@ class OpenTouchForceDataset(Dataset):
         normalize_action_proprio: bool = True,
         strict_schema: bool = True,
         prompt_template: str = "Manipulate the object using visual and tactile feedback: {task}",
+        sample_rate_hz: float = 30.0,
+        gripper_closed_ratio: float = 0.18,
+        gripper_open_ratio: float = 1.35,
     ) -> None:
         super().__init__()
         if split not in {"train", "val", "test"}:
@@ -80,8 +88,13 @@ class OpenTouchForceDataset(Dataset):
         self.strict_schema = bool(strict_schema)
         self.normalize_action_proprio = bool(normalize_action_proprio)
         self.prompt_template = str(prompt_template)
+        self.sample_rate_hz = float(sample_rate_hz)
+        self.gripper_closed_ratio = float(gripper_closed_ratio)
+        self.gripper_open_ratio = float(gripper_open_ratio)
 
         asset = Path(__file__).with_name("assets") / "fingertip_taxels.json"
+        self.taxel_mask_path = asset
+        self.taxel_mask_sha256 = hashlib.sha256(asset.read_bytes()).hexdigest()
         spec = json.loads(asset.read_text(encoding="utf-8"))
         names = list(spec["finger_names"])
         if names[:2] != ["thumb", "index"]:
@@ -159,6 +172,7 @@ class OpenTouchForceDataset(Dataset):
                 self.windows.append((path, demo_name, anchor))
         if not self.windows:
             raise RuntimeError(f"OpenTouch split {split!r} contains no valid windows")
+        self._contact_window_cache: dict[int, int] = {}
 
     def _group_split(self, group: str) -> str:
         return self.group_to_split[group]
@@ -195,9 +209,11 @@ class OpenTouchForceDataset(Dataset):
             "seed": self.split_seed,
             "ratios": self.split_ratios,
             "split_version": 2,
+            "processing_version": self.PROCESSING_VERSION,
             "baseline": self.pressure_baseline,
             "deadzone": self.force_deadzone,
             "asinh_scale": self.force_asinh_scale,
+            "taxel_mask_sha256": self.taxel_mask_sha256,
         }
         digest = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()[:16]
         return self.cache_root / f"force_stats_{digest}.json"
@@ -230,6 +246,9 @@ class OpenTouchForceDataset(Dataset):
             f"{source.resolve()}:{source.stat().st_mtime_ns}:{demo_name}:"
             f"{self.workspace_scale_m}:{self.smoothing_window}:"
             f"{self.max_delta_translation_m}:{self.max_delta_rotation_rad}:"
+            f"{self.PROCESSING_VERSION}:{self.gripper_closed_ratio}:{self.gripper_open_ratio}:"
+            f"{self.pressure_baseline}:{self.force_deadzone}:{self.force_asinh_scale}:{self.force_clip}:"
+            f"{self.taxel_mask_sha256}:"
             f"{self.force_median.tolist()}:{self.force_scale.tolist()}"
         )
         digest = hashlib.sha256(signature.encode()).hexdigest()
@@ -241,10 +260,13 @@ class OpenTouchForceDataset(Dataset):
             "seed": self.split_seed,
             "ratios": self.split_ratios,
             "split_version": 2,
+            "processing_version": self.PROCESSING_VERSION,
             "workspace_scale_m": self.workspace_scale_m,
             "smoothing_window": self.smoothing_window,
             "max_delta_translation_m": self.max_delta_translation_m,
             "max_delta_rotation_rad": self.max_delta_rotation_rad,
+            "gripper_closed_ratio": self.gripper_closed_ratio,
+            "gripper_open_ratio": self.gripper_open_ratio,
         }
         digest = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()[:16]
         return self.cache_root / f"robot_stats_{digest}.json"
@@ -307,6 +329,8 @@ class OpenTouchForceDataset(Dataset):
                 external,
                 workspace_scale_m=self.workspace_scale_m,
                 smoothing_window=self.smoothing_window,
+                gripper_closed_ratio=self.gripper_closed_ratio,
+                gripper_open_ratio=self.gripper_open_ratio,
             )
             if "timestamps" in demo and len(demo["timestamps"]) == len(landmarks):
                 timestamps = np.asarray(demo["timestamps"][()], dtype=np.float64)
@@ -374,6 +398,26 @@ class OpenTouchForceDataset(Dataset):
     def __len__(self) -> int:
         return len(self.windows)
 
+    def find_contact_window(self, start_index: int = 0) -> int:
+        """Return a deterministic validation window with observed valid contact."""
+        start_index = int(start_index) % len(self.windows)
+        if start_index in self._contact_window_cache:
+            return self._contact_window_cache[start_index]
+        for offset in range(len(self.windows)):
+            index = (start_index + offset) % len(self.windows)
+            source, demo_name, anchor = self.windows[index]
+            episode = self._load_numeric_episode(source, demo_name)
+            begin = anchor - self.history_steps
+            stop = anchor + 1
+            force = episode["force"][begin:stop]
+            valid = episode["force_valid"][begin:stop]
+            physical_force = self.denormalize_force(force)
+            if np.any(valid & (physical_force > self.force_deadzone + 1e-6)):
+                self._contact_window_cache[start_index] = index
+                return index
+        self._contact_window_cache[start_index] = start_index
+        return start_index
+
     def normalize_force(self, force: np.ndarray) -> np.ndarray:
         transformed = np.arcsinh(
             np.maximum(np.asarray(force, dtype=np.float32) - self.force_deadzone, 0.0)
@@ -398,6 +442,178 @@ class OpenTouchForceDataset(Dataset):
 
     def denormalize_action(self, action: np.ndarray) -> np.ndarray:
         return (np.asarray(action) * self.action_scale + self.action_mean).astype(np.float32)
+
+    def _git_commit(self) -> str:
+        repository = Path(__file__).resolve()
+        for parent in repository.parents:
+            if (parent / ".git").exists():
+                try:
+                    result = subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=parent,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    return result.stdout.strip()
+                except (OSError, subprocess.SubprocessError):
+                    break
+        return "unknown"
+
+    def _source_file_records(self) -> list[dict[str, Any]]:
+        hash_cache_path = self.cache_root / "source_file_hashes.json"
+        if hash_cache_path.exists():
+            try:
+                cached = json.loads(hash_cache_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                cached = {}
+        else:
+            cached = {}
+        records = []
+        updated_cache: dict[str, Any] = {}
+        for path in self.files:
+            stat = path.stat()
+            key = str(path.resolve())
+            entry = cached.get(key, {})
+            if (
+                entry.get("size_bytes") == stat.st_size
+                and entry.get("mtime_ns") == stat.st_mtime_ns
+                and isinstance(entry.get("sha256"), str)
+            ):
+                digest = entry["sha256"]
+            else:
+                hasher = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                        hasher.update(chunk)
+                digest = hasher.hexdigest()
+            updated_cache[key] = {
+                "size_bytes": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "sha256": digest,
+            }
+            records.append(
+                {
+                    "name": path.name,
+                    "size_bytes": stat.st_size,
+                    "sha256": digest,
+                    "split": self._group_split(path.stem),
+                }
+            )
+        temporary = hash_cache_path.with_name(
+            f"{hash_cache_path.name}.{os.getpid()}.tmp"
+        )
+        temporary.write_text(
+            json.dumps(updated_cache, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        os.replace(temporary, hash_cache_path)
+        return records
+
+    def normalization_payload(self) -> dict[str, np.ndarray]:
+        return {
+            "action_mean": self.action_mean.astype(np.float32),
+            "action_scale": self.action_scale.astype(np.float32),
+            "proprio_mean": self.proprio_mean.astype(np.float32),
+            "proprio_scale": self.proprio_scale.astype(np.float32),
+            "force_median": self.force_median.astype(np.float32),
+            "force_scale": self.force_scale.astype(np.float32),
+        }
+
+    def data_contract_payload(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.DATA_CONTRACT_VERSION,
+            "processing_version": self.PROCESSING_VERSION,
+            "code_commit": self._git_commit(),
+            "sample_rate_hz": self.sample_rate_hz,
+            "timeline": {
+                "video_offsets": self.video_indices,
+                "force_offsets": list(range(-self.history_steps, self.future_steps + 1)),
+                "action_offsets": list(range(1, self.future_steps + 1)),
+            },
+            "coordinate_system": {
+                "name": "sequence_initial_palm_canonical_frame",
+                "position": "p_C[t] = R_0^T @ (p[t] - p[0]) * workspace_scale / hand_scale",
+                "orientation": "R_C[t] = R_0^T @ R[t]",
+            },
+            "proprio": {
+                "shape": [1, 8],
+                "dimensions": [
+                    "position_x_m_canonical",
+                    "position_y_m_canonical",
+                    "position_z_m_canonical",
+                    "orientation_qw_canonical",
+                    "orientation_qx_canonical",
+                    "orientation_qy_canonical",
+                    "orientation_qz_canonical",
+                    "absolute_gripper_opening_0_1",
+                ],
+            },
+            "action_chunk": {
+                "shape": [self.future_steps, 7],
+                "dimensions": [
+                    "delta_position_x_m_canonical",
+                    "delta_position_y_m_canonical",
+                    "delta_position_z_m_canonical",
+                    "delta_rotation_x_rad_canonical_spatial_rotvec",
+                    "delta_rotation_y_rad_canonical_spatial_rotvec",
+                    "delta_rotation_z_rad_canonical_spatial_rotvec",
+                    "next_absolute_gripper_opening_0_1",
+                ],
+                "note": "Only dimensions 0:6 are deltas; dimension 6 is an absolute next target.",
+            },
+            "force": {
+                "shape": [self.total_force_steps, 2],
+                "finger_order": ["thumb", "index"],
+                "pressure_baseline": self.pressure_baseline,
+                "deadzone": self.force_deadzone,
+                "asinh_scale": self.force_asinh_scale,
+                "normalized_clip": self.force_clip,
+                "taxel_mask_sha256": self.taxel_mask_sha256,
+            },
+            "retarget": {
+                "workspace_scale_m": self.workspace_scale_m,
+                "smoothing_window": self.smoothing_window,
+                "gripper_closed_ratio": self.gripper_closed_ratio,
+                "gripper_open_ratio": self.gripper_open_ratio,
+                "max_delta_translation_m": self.max_delta_translation_m,
+                "max_delta_rotation_rad": self.max_delta_rotation_rad,
+            },
+        }
+
+    def split_manifest_payload(self) -> dict[str, Any]:
+        episode_records = [
+            {
+                "source": source.name,
+                "episode": demo_name,
+                "frames": frames,
+                "split": self._group_split(source.stem),
+            }
+            for source, demo_name, frames in self._all_episodes
+        ]
+        return {
+            "schema_version": 1,
+            "split_seed": self.split_seed,
+            "split_ratios": list(self.split_ratios),
+            "source_files": self._source_file_records(),
+            "episodes": episode_records,
+        }
+
+    def export_data_artifacts(self, directory: str | Path) -> dict[str, str]:
+        return write_artifacts(
+            directory,
+            normalization=self.normalization_payload(),
+            data_contract=self.data_contract_payload(),
+            split_manifest=self.split_manifest_payload(),
+        )
+
+    def validate_data_artifacts(self, directory: str | Path) -> None:
+        verify_artifact_payloads(
+            directory,
+            normalization=self.normalization_payload(),
+            data_contract=self.data_contract_payload(),
+            split_manifest=self.split_manifest_payload(),
+        )
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         source, demo_name, anchor = self.windows[index]

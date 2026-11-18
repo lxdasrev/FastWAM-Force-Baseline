@@ -527,7 +527,10 @@ def run_inference(cfg: DictConfig):
         ckpt = Path(checkpoint_path)
         if ckpt.exists():
             logger.info("Loading finetuned checkpoint: %s", checkpoint_path)
-            model.load_checkpoint(checkpoint_path)
+            model.load_checkpoint(
+                checkpoint_path,
+                data_artifact_dir=inference_cfg.get("data_artifact_dir"),
+            )
         else:
             logger.warning("Checkpoint not found, skipping load: %s", checkpoint_path)
     model.eval()

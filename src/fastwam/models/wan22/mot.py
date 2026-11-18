@@ -42,6 +42,7 @@ class MoT(nn.Module):
             raise ValueError("Wan MoT gradient checkpointing is not supported by the compiled tensor core.")
         self.mot_checkpoint_mixed_attn = False
         self.compile_training_layers = False
+        self._last_force_bridge_stats: Dict[str, torch.Tensor] = {}
 
         first_expert = self.mixtures[self.expert_order[0]]
         self.num_layers = len(first_expert.blocks)
@@ -96,6 +97,24 @@ class MoT(nn.Module):
         for name in self.expert_order:
             expert = self.mixtures[name]
             logger.info(f"  Expert '{name}': num_params={sum(p.numel() for p in expert.parameters()) / 1e9:.2f} B")
+
+    @staticmethod
+    def _mix_va_with_force_gate(
+        mixed_va: torch.Tensor,
+        mixed_vfa: torch.Tensor,
+        *,
+        video_len: int,
+        force_len: int,
+        gate_parameter: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        gate = torch.tanh(gate_parameter).to(dtype=mixed_va.dtype)
+        mixed_video = mixed_va[:, :video_len] + gate * (
+            mixed_vfa[:, :video_len] - mixed_va[:, :video_len]
+        )
+        mixed_action = mixed_va[:, video_len:] + gate * (
+            mixed_vfa[:, video_len + force_len :] - mixed_va[:, video_len:]
+        )
+        return mixed_video, mixed_action
 
     @staticmethod
     def _split_modulation(block, t_mod: torch.Tensor):
@@ -768,6 +787,7 @@ class MoT(nn.Module):
             self.force_expert.temporal_freqs,
             self.force_expert.spatial_freqs,
             force_state["temporal_mask"],
+            force_state["valid_mask"],
         )
         force_flat = force_tokens.flatten(1, 2)
 
@@ -798,11 +818,19 @@ class MoT(nn.Module):
         video_len = video_tokens.shape[1]
         force_len = force_flat.shape[1]
         gate = torch.tanh(self.force_va_gates[str(layer_idx)]).to(dtype=mixed_va.dtype)
-        mixed_video = mixed_va[:, :video_len] + gate * (
-            mixed_vfa[:, :video_len] - mixed_va[:, :video_len]
+        self._last_force_bridge_stats[str(layer_idx)] = torch.stack(
+            [
+                gate.detach().float(),
+                (mixed_vfa[:, :video_len] - mixed_va[:, :video_len]).detach().float().square().mean().sqrt(),
+                (mixed_vfa[:, video_len + force_len :] - mixed_va[:, video_len:]).detach().float().square().mean().sqrt(),
+            ]
         )
-        mixed_action = mixed_va[:, video_len:] + gate * (
-            mixed_vfa[:, video_len + force_len :] - mixed_va[:, video_len:]
+        mixed_video, mixed_action = self._mix_va_with_force_gate(
+            mixed_va,
+            mixed_vfa,
+            video_len=video_len,
+            force_len=force_len,
+            gate_parameter=self.force_va_gates[str(layer_idx)],
         )
         mixed_force = mixed_vfa[:, video_len : video_len + force_len]
 
@@ -834,6 +862,7 @@ class MoT(nn.Module):
             force_state["context"],
             force_state["context_mask"],
             bridge_attention=mixed_force,
+            valid_mask=force_state["valid_mask"],
         )
         return video_tokens, action_tokens, force_tokens
 

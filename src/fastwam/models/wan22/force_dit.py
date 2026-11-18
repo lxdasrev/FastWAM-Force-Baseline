@@ -54,6 +54,13 @@ class ForceEncoder(nn.Module):
             raise ValueError(f"Force sequence {timesteps} exceeds max_timesteps={self.max_timesteps}")
 
         device = force.device
+        if valid_mask is not None:
+            if valid_mask.shape != force.shape:
+                raise ValueError(
+                    f"`valid_mask` must match force shape {tuple(force.shape)}, got {tuple(valid_mask.shape)}"
+                )
+            valid_mask = valid_mask.to(device=device, dtype=torch.bool)
+            force = torch.where(valid_mask, force, torch.zeros_like(force))
         time_ids = torch.arange(timesteps, device=device)
         finger_ids = torch.arange(fingers, device=device)
         type_ids = (time_ids >= self.observed_steps).long()
@@ -63,11 +70,9 @@ class ForceEncoder(nn.Module):
         tokens = tokens + self.observed_future_embedding(type_ids)[None, :, None, :]
         tokens = self.norm(tokens)
         if valid_mask is not None:
-            if valid_mask.shape != force.shape:
-                raise ValueError(
-                    f"`valid_mask` must match force shape {tuple(force.shape)}, got {tuple(valid_mask.shape)}"
-                )
-            tokens = tokens * valid_mask.to(device=device, dtype=tokens.dtype).unsqueeze(-1)
+            tokens = torch.where(
+                valid_mask.unsqueeze(-1), tokens, torch.zeros_like(tokens)
+            )
         return tokens
 
 
@@ -145,31 +150,57 @@ class ForceBlock(nn.Module):
         temporal_freqs: torch.Tensor,
         spatial_freqs: torch.Tensor,
         temporal_mask: torch.Tensor,
+        valid_mask: torch.Tensor,
     ) -> torch.Tensor:
         if x.ndim != 4:
             raise ValueError(f"Force tokens must be [B,T,F,D], got {tuple(x.shape)}")
         batch_size, timesteps, fingers, hidden = x.shape
+        if valid_mask.shape != (batch_size, timesteps, fingers):
+            raise ValueError(
+                "Force valid_mask must be [B,T,F], got "
+                f"{tuple(valid_mask.shape)} for tokens {tuple(x.shape)}"
+            )
+        valid_mask = valid_mask.to(device=x.device, dtype=torch.bool)
+        valid_tokens = valid_mask.unsqueeze(-1)
+        x = torch.where(valid_tokens, x, torch.zeros_like(x))
         mods = self._modulations(t_mod, self.modulation.to(dtype=x.dtype, device=x.device))
         t_shift, t_scale, t_gate, s_shift, s_scale, s_gate, _, _, _ = mods
 
         temporal_input = modulate(self.norm_temporal(x), t_shift, t_scale)
         temporal_input = temporal_input.permute(0, 2, 1, 3).reshape(batch_size * fingers, timesteps, hidden)
+        temporal_valid = valid_mask.permute(0, 2, 1).reshape(batch_size * fingers, timesteps)
+        temporal_allowed = (
+            temporal_mask[:timesteps, :timesteps][None, None]
+            & temporal_valid[:, None, None, :]
+        )
+        # SDPA kernels are not uniformly NaN-safe for an all-masked row.  The
+        # placeholder key is removed again by zeroing invalid query outputs.
+        empty_rows = ~temporal_allowed.any(dim=-1, keepdim=True)
+        temporal_allowed = temporal_allowed.clone()
+        temporal_allowed[..., :1] |= empty_rows
         temporal_out = self.temporal_attn(
             temporal_input,
             temporal_freqs[:timesteps].view(timesteps, 1, -1),
-            self_attn_mask=temporal_mask[:timesteps, :timesteps],
+            self_attn_mask=temporal_allowed,
         )
         temporal_out = temporal_out.reshape(batch_size, fingers, timesteps, hidden).permute(0, 2, 1, 3)
-        x = x + t_gate * temporal_out
+        temporal_out = torch.where(valid_tokens, temporal_out, torch.zeros_like(temporal_out))
+        x = torch.where(valid_tokens, x + t_gate * temporal_out, torch.zeros_like(x))
 
         spatial_input = modulate(self.norm_spatial(x), s_shift, s_scale)
         spatial_input = spatial_input.reshape(batch_size * timesteps, fingers, hidden)
+        spatial_valid = valid_mask.reshape(batch_size * timesteps, fingers)
+        spatial_allowed = spatial_valid[:, None, None, :].expand(-1, 1, fingers, -1).clone()
+        empty_rows = ~spatial_allowed.any(dim=-1, keepdim=True)
+        spatial_allowed[..., :1] |= empty_rows
         spatial_out = self.spatial_attn(
             spatial_input,
             spatial_freqs[:fingers].view(fingers, 1, -1),
+            self_attn_mask=spatial_allowed,
         )
         spatial_out = spatial_out.reshape(batch_size, timesteps, fingers, hidden)
-        return x + s_gate * spatial_out
+        spatial_out = torch.where(valid_tokens, spatial_out, torch.zeros_like(spatial_out))
+        return torch.where(valid_tokens, x + s_gate * spatial_out, torch.zeros_like(x))
 
     def prepare_bridge(self, x_flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bridge_input = self.norm_bridge(x_flat)
@@ -186,11 +217,21 @@ class ForceBlock(nn.Module):
         context: torch.Tensor,
         context_mask: torch.Tensor,
         bridge_attention: Optional[torch.Tensor] = None,
+        valid_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch_size, timesteps, fingers, hidden = x.shape
+        if valid_mask is None:
+            valid_mask = torch.ones((batch_size, timesteps, fingers), device=x.device, dtype=torch.bool)
+        if valid_mask.shape != (batch_size, timesteps, fingers):
+            raise ValueError(f"Force valid_mask shape mismatch: {tuple(valid_mask.shape)}")
+        flat_valid = valid_mask.to(device=x.device, dtype=torch.bool).reshape(
+            batch_size, timesteps * fingers, 1
+        )
         flat = x.reshape(batch_size, timesteps * fingers, hidden)
+        flat = torch.where(flat_valid, flat, torch.zeros_like(flat))
         if bridge_attention is not None:
             flat = flat + torch.tanh(self.bridge_gate) * self.bridge_o(bridge_attention)
+            flat = torch.where(flat_valid, flat, torch.zeros_like(flat))
 
         cross_mask = context_mask
         if cross_mask.ndim == 2:
@@ -198,6 +239,7 @@ class ForceBlock(nn.Module):
         if cross_mask.ndim == 3:
             cross_mask = cross_mask.unsqueeze(1)
         flat = flat + self.cross_attn(self.norm_cross(flat), context, ctx_mask=cross_mask)
+        flat = torch.where(flat_valid, flat, torch.zeros_like(flat))
 
         mods = self._modulations(t_mod, self.modulation.to(dtype=x.dtype, device=x.device))
         f_shift, f_scale, f_gate = mods[6:9]
@@ -206,6 +248,7 @@ class ForceBlock(nn.Module):
         f_gate = f_gate.reshape(batch_size, timesteps * fingers, hidden)
         ffn_input = modulate(self.norm_ffn(flat), f_shift, f_scale)
         flat = flat + f_gate * self.ffn(ffn_input)
+        flat = torch.where(flat_valid, flat, torch.zeros_like(flat))
         return flat.reshape(batch_size, timesteps, fingers, hidden)
 
 
@@ -308,6 +351,13 @@ class ForceDiT(nn.Module):
         token_time = future_time[:, None, None, :].expand(-1, self.total_steps, self.num_fingers, -1).clone()
         token_time[:, : self.observed_steps] = clean_time[:, None, None, :]
         t_mod = self.time_projection(token_time).unflatten(-1, (9, self.hidden_dim))
+        if valid_mask is None:
+            valid_mask = torch.isfinite(force)
+        else:
+            valid_mask = (
+                valid_mask.to(device=force.device, dtype=torch.bool)
+                & torch.isfinite(force)
+            )
         tokens = self.encoder(force, valid_mask=valid_mask)
         return {
             "tokens": tokens,
@@ -316,6 +366,7 @@ class ForceDiT(nn.Module):
             "context": self.text_embedding(context),
             "context_mask": context_mask,
             "temporal_mask": self.build_temporal_mask(force.device),
+            "valid_mask": valid_mask,
         }
 
     def run_unbridged_block(self, block_idx: int, x: torch.Tensor, state: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -326,10 +377,29 @@ class ForceDiT(nn.Module):
             self.temporal_freqs,
             self.spatial_freqs,
             state["temporal_mask"],
+            state["valid_mask"],
         )
-        return block.finish(x, state["t_mod"], state["context"], state["context_mask"])
+        return block.finish(
+            x,
+            state["t_mod"],
+            state["context"],
+            state["context_mask"],
+            valid_mask=state["valid_mask"],
+        )
 
-    def post(self, x: torch.Tensor, token_time: torch.Tensor) -> torch.Tensor:
+    def post(
+        self,
+        x: torch.Tensor,
+        token_time: torch.Tensor,
+        valid_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         batch_size, timesteps, fingers, hidden = x.shape
         flat = x.reshape(batch_size, timesteps * fingers, hidden)
-        return self.head(flat, token_time).reshape(batch_size, timesteps, fingers)
+        output = self.head(flat, token_time).reshape(batch_size, timesteps, fingers)
+        if valid_mask is not None:
+            output = torch.where(
+                valid_mask.to(device=output.device, dtype=torch.bool),
+                output,
+                torch.zeros_like(output),
+            )
+        return output

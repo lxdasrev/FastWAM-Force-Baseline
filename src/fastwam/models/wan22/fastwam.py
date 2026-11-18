@@ -1,4 +1,5 @@
-from typing import Any, Optional, Sequence, Union
+from pathlib import Path
+from typing import Any, Mapping, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -6,6 +7,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from fastwam.utils.logging_config import get_logger
+from fastwam.datasets.opentouch.contract import verify_artifact_hashes
 
 from .action_dit import ActionDiT
 from .force_dit import ForceDiT
@@ -14,6 +16,47 @@ from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 
 logger = get_logger(__name__)
+
+
+def compute_masked_force_flow_loss(
+    pred_force: torch.Tensor,
+    target_force: torch.Tensor,
+    valid_force: torch.Tensor,
+    training_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return raw/weighted per-sample Force MSE and validity diagnostics."""
+    if pred_force.shape != target_force.shape or pred_force.shape != valid_force.shape:
+        raise ValueError(
+            "pred_force, target_force and valid_force must have identical [B,T,F] shapes, got "
+            f"{tuple(pred_force.shape)}, {tuple(target_force.shape)}, {tuple(valid_force.shape)}"
+        )
+    element_loss = F.mse_loss(
+        pred_force.float(), target_force.float(), reduction="none"
+    )
+    valid_float = valid_force.to(device=element_loss.device, dtype=element_loss.dtype)
+    valid_elements_per_sample = valid_float.sum(dim=(1, 2))
+    sample_has_force = valid_elements_per_sample > 0
+    sample_valid_float = sample_has_force.to(dtype=element_loss.dtype)
+    sample_mse = (
+        (element_loss * valid_float).sum(dim=(1, 2))
+        / valid_elements_per_sample.clamp(min=1.0)
+    )
+    valid_sample_count = sample_valid_float.sum()
+    denominator = valid_sample_count.clamp(min=1.0)
+    raw_loss = (sample_mse * sample_valid_float).sum() / denominator
+    weight = training_weight.to(device=sample_mse.device, dtype=sample_mse.dtype)
+    if weight.ndim == 0:
+        weight = weight.expand_as(sample_mse)
+    if weight.shape != sample_mse.shape:
+        raise ValueError(
+            f"training_weight must be scalar or [B], got {tuple(weight.shape)} for B={sample_mse.shape[0]}"
+        )
+    weighted_loss = (sample_mse * weight * sample_valid_float).sum() / denominator
+    differentiable_zero = pred_force.float().sum() * 0.0
+    has_any = (valid_sample_count > 0).to(dtype=raw_loss.dtype)
+    raw_loss = raw_loss * has_any + differentiable_zero
+    weighted_loss = weighted_loss * has_any + differentiable_zero
+    return raw_loss, weighted_loss, valid_float.mean(), valid_sample_count
 
 
 class FastWAM(torch.nn.Module):
@@ -456,6 +499,14 @@ class FastWAM(torch.nn.Module):
                     f"{tuple(force_is_pad.shape)}"
                 )
             force_is_pad = force_is_pad.to(device=self.device, dtype=torch.bool, non_blocking=True)
+            # Keep one authoritative validity mask throughout ForceEncoder,
+            # local attention, MoT and the force objective.
+            force_valid = (
+                force_valid
+                & (~force_is_pad[:, :, None])
+                & torch.isfinite(force)
+            )
+            force = torch.where(force_valid, force, torch.zeros_like(force))
 
         if action_is_pad is not None:
             action_is_pad = action_is_pad.to(device=self.device, dtype=torch.bool, non_blocking=True)
@@ -508,6 +559,7 @@ class FastWAM(torch.nn.Module):
         action_seq_len: int,
         video_tokens_per_frame: int,
         device: torch.device,
+        force_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.force_expert is None:
             raise RuntimeError("Force attention mask requested without ForceExpert.")
@@ -536,7 +588,29 @@ class FastWAM(torch.nn.Module):
         # A -> V0,F0,F+,A.
         mask[action_start:, :first_frame_tokens] = True
         mask[action_start:, force_start:total] = True
-        return mask
+        if force_valid is None:
+            return mask
+        expected = (
+            force_valid.shape[0],
+            self.force_expert.total_steps,
+            self.force_expert.num_fingers,
+        )
+        if tuple(force_valid.shape) != expected:
+            raise ValueError(
+                "force_valid must be [B,T,F] for the Force MoT mask, got "
+                f"{tuple(force_valid.shape)}"
+            )
+        batch_size = force_valid.shape[0]
+        batched_mask = mask[None, None].expand(batch_size, 1, total, total).clone()
+        flat_valid = force_valid.to(device=device, dtype=torch.bool).flatten(1)
+        batched_mask[..., force_start:action_start] &= flat_valid[:, None, None, :]
+
+        # Every Video and Action query already has a valid Video/Action key.
+        # Invalid Force queries are cleared after the ForceBlock, but keep a
+        # safe placeholder here for kernels that reject fully masked rows.
+        empty_rows = ~batched_mask.any(dim=-1, keepdim=True)
+        batched_mask[..., :1] |= empty_rows
+        return batched_mask
 
     def _compute_video_loss_per_sample(
         self,
@@ -717,7 +791,11 @@ class FastWAM(torch.nn.Module):
         return (
             self.video_expert.post(video_tokens, t_video, f_video, h_video, w_video),
             self.action_expert.post(action_tokens),
-            self.force_expert.post(force_tokens, force_state["token_time"]),
+            self.force_expert.post(
+                force_tokens,
+                force_state["token_time"],
+                valid_mask=force_state["valid_mask"],
+            ),
         )
 
     def training_loss(self, sample, tiled: bool = False):
@@ -800,6 +878,7 @@ class FastWAM(torch.nn.Module):
                 action_seq_len=noisy_action.shape[1],
                 video_tokens_per_frame=tokens_per_frame,
                 device=latents.device,
+                force_valid=force_valid,
             )
             pred_video, pred_action, pred_force = self._joint_force_denoise_core(
                 latents_video=latents,
@@ -847,25 +926,56 @@ class FastWAM(torch.nn.Module):
         loss_action = (action_loss_per_sample * action_weight).mean()
 
         loss_force = None
+        raw_force_loss = None
+        scheduler_weighted_force_loss = None
+        force_valid_fraction = None
+        force_valid_samples = None
         if self.force_expert is not None:
             pred_force_future = pred_force[:, self.force_expert.observed_steps :]
-            force_loss_element = F.mse_loss(
-                pred_force_future.float(), target_force_future.float(), reduction="none"
-            )
             valid_force = force_valid[:, self.force_expert.observed_steps :]
-            valid_force = valid_force & (~force_is_pad[:, self.force_expert.observed_steps :, None])
-            valid_force_float = valid_force.to(dtype=force_loss_element.dtype)
-            loss_force = (force_loss_element * valid_force_float).sum() / valid_force_float.sum().clamp(min=1.0)
+            force_weight = self.train_force_scheduler.training_weight(timestep_force).to(
+                pred_force_future.device, dtype=torch.float32
+            )
+            (
+                raw_force_loss,
+                scheduler_weighted_force_loss,
+                force_valid_fraction,
+                force_valid_samples,
+            ) = compute_masked_force_flow_loss(
+                pred_force_future,
+                target_force_future,
+                valid_force,
+                force_weight,
+            )
+            loss_force = self.loss_lambda_force * scheduler_weighted_force_loss
 
         loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
         if loss_force is not None:
-            loss_total = loss_total + self.loss_lambda_force * loss_force
+            loss_total = loss_total + loss_force
         loss_dict = {
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
         }
         if loss_force is not None:
-            loss_dict["loss_force"] = self.loss_lambda_force * float(loss_force.detach().item())
+            loss_dict.update(
+                {
+                    "raw_force_loss": float(raw_force_loss.detach().item()),
+                    "scheduler_weighted_force_loss": float(
+                        scheduler_weighted_force_loss.detach().item()
+                    ),
+                    "loss_force": float(loss_force.detach().item()),
+                    "force_valid_fraction": float(force_valid_fraction.detach().item()),
+                    "force_valid_samples": float(force_valid_samples.detach().item()),
+                }
+            )
+            for layer, parameter in self.mot.force_va_gates.items():
+                loss_dict[f"force_gate_raw_{layer}"] = float(parameter.detach().float().item())
+                loss_dict[f"force_gate_tanh_{layer}"] = float(
+                    torch.tanh(parameter.detach().float()).item()
+                )
+            for layer, stats in self.mot._last_force_bridge_stats.items():
+                loss_dict[f"force_bridge_video_delta_rms_{layer}"] = float(stats[1].item())
+                loss_dict[f"force_bridge_action_delta_rms_{layer}"] = float(stats[2].item())
         return loss_total, loss_dict
 
     @torch.no_grad()
@@ -1425,6 +1535,8 @@ class FastWAM(torch.nn.Module):
         prompt: Optional[str],
         input_image: torch.Tensor,
         force_history: torch.Tensor,
+        force_history_valid: Optional[torch.Tensor] = None,
+        force_history_is_pad: Optional[torch.Tensor] = None,
         action_horizon: int = 32,
         proprio: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
@@ -1457,6 +1569,31 @@ class FastWAM(torch.nn.Module):
         if tuple(force_history.shape) != expected_history:
             raise ValueError(f"`force_history` must be {expected_history}, got {tuple(force_history.shape)}")
         force_history = force_history.to(device=self.device, dtype=self.torch_dtype)
+        if force_history_valid is None:
+            force_history_valid = torch.ones(expected_history, device=self.device, dtype=torch.bool)
+        else:
+            if force_history_valid.ndim == 2:
+                force_history_valid = force_history_valid.unsqueeze(0)
+            if tuple(force_history_valid.shape) != expected_history:
+                raise ValueError(
+                    f"`force_history_valid` must be {expected_history}, got {tuple(force_history_valid.shape)}"
+                )
+            force_history_valid = force_history_valid.to(device=self.device, dtype=torch.bool)
+        if force_history_is_pad is not None:
+            if force_history_is_pad.ndim == 1:
+                force_history_is_pad = force_history_is_pad.unsqueeze(0)
+            expected_pad = (1, self.force_expert.observed_steps)
+            if tuple(force_history_is_pad.shape) != expected_pad:
+                raise ValueError(
+                    f"`force_history_is_pad` must be {expected_pad}, got {tuple(force_history_is_pad.shape)}"
+                )
+            force_history_valid &= ~force_history_is_pad.to(
+                device=self.device, dtype=torch.bool
+            )[:, :, None]
+        force_history_valid &= torch.isfinite(force_history)
+        force_history = torch.where(
+            force_history_valid, force_history, torch.zeros_like(force_history)
+        )
 
         if proprio is not None:
             if self.proprio_dim is None:
@@ -1512,16 +1649,18 @@ class FastWAM(torch.nn.Module):
             video_tokens_per_frame=tokens_per_frame,
             device=self.device,
         )
+        force_valid = torch.ones(
+            (1, self.force_expert.total_steps, self.force_expert.num_fingers),
+            device=self.device,
+            dtype=torch.bool,
+        )
+        force_valid[:, : self.force_expert.observed_steps] = force_history_valid
         vfa_mask = self._build_force_mot_attention_mask(
             video_seq_len=video_seq_len,
             action_seq_len=action_horizon,
             video_tokens_per_frame=tokens_per_frame,
             device=self.device,
-        )
-        force_valid = torch.ones(
-            (1, self.force_expert.total_steps, self.force_expert.num_fingers),
-            device=self.device,
-            dtype=torch.bool,
+            force_valid=force_valid,
         )
         action_ts, action_deltas = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
@@ -1603,10 +1742,18 @@ class FastWAM(torch.nn.Module):
             tiled=tiled,
         )
 
-    def save_checkpoint(self, path, optimizer=None, step=None):
+    def save_checkpoint(
+        self,
+        path,
+        optimizer=None,
+        step=None,
+        data_artifact_hashes: Optional[Mapping[str, str]] = None,
+    ):
         payload = {
             "mot": self.mot.state_dict(),
-            "schema_version": 2,
+            # Preserve compatibility for non-OpenTouch tasks that do not
+            # provide data sidecars.
+            "schema_version": 3 if data_artifact_hashes is not None else 2,
             "step": step,
             "torch_dtype": str(self.torch_dtype),
         }
@@ -1617,14 +1764,34 @@ class FastWAM(torch.nn.Module):
                 "num_fingers": self.force_expert.num_fingers,
                 "bridge_layers": dict(self.mot.force_bridge_layers),
             }
+        if data_artifact_hashes is not None:
+            payload["data_artifact_hashes"] = dict(data_artifact_hashes)
         if self.proprio_encoder is not None:
             payload["proprio_encoder"] = self.proprio_encoder.state_dict()
         if optimizer is not None:
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
 
-    def load_checkpoint(self, path, optimizer=None):
+    def load_checkpoint(
+        self,
+        path,
+        optimizer=None,
+        data_artifact_dir: Optional[str] = None,
+    ):
         payload = torch.load(path, map_location="cpu")
+        expected_artifact_hashes = payload.get("data_artifact_hashes")
+        if expected_artifact_hashes is not None:
+            artifact_dir = (
+                Path(data_artifact_dir)
+                if data_artifact_dir is not None
+                else Path(path).with_suffix("")
+            )
+            verify_artifact_hashes(artifact_dir, expected_artifact_hashes)
+            logger.info("Verified checkpoint data artifacts in %s", artifact_dir)
+        elif int(payload.get("schema_version", 0)) >= 3:
+            raise ValueError(
+                f"Checkpoint schema_version={payload.get('schema_version')} has no data_artifact_hashes"
+            )
         if "mot" in payload:
             incompatible = self.mot.load_state_dict(payload["mot"], strict=False)
             if incompatible.missing_keys:

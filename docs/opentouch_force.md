@@ -101,3 +101,40 @@ denormalize -> canonical-to-base transform -> Cartesian/IK controller
 
 Predicted future pressure is a model signal, not a replacement for a fast
 hardware overload or slip-protection loop.
+# Action and proprio contract
+
+OpenTouch retargeting uses the first valid palm pose as a fixed canonical
+frame. Proprio is an absolute pose in this frame. An action chunk has shape
+`[32, 7]`: dimensions `0:3` are canonical-frame translation increments in
+metres, dimensions `3:6` are canonical-frame spatial rotation-vector
+increments in radians, and dimension `6` is the next **absolute** gripper
+opening target. The seventh dimension is not a delta.
+
+# Training launch
+
+Training keeps the original FastWAM launcher. The first argument must equal
+the number of devices listed in `CUDA_VISIBLE_DEVICES`:
+
+```bash
+CUDA_VISIBLE_DEVICES=2 \
+bash scripts/train_zero2.sh 1 task=opentouch_force_224_1e-4
+
+CUDA_VISIBLE_DEVICES=1,3,5,7 \
+bash scripts/train_zero2.sh 4 task=opentouch_force_224_1e-4 \
+  gradient_accumulation_steps=4
+```
+
+`batch_size` is per GPU, so the effective batch is `batch_size * world_size *
+gradient_accumulation_steps`. The task configuration uses a 1,000-step Force
+warmup and a 10,000-step joint pilot by default. Use `max_steps=200` for a
+smoke run. Data-contract mismatches are fatal unless the explicit diagnostic
+override `allow_data_contract_mismatch=true` is supplied.
+For a lower-memory single-GPU pilot, add `train_video_expert=false`; this is an
+explicit choice and the trainer never changes it silently.
+
+# Checkpoint data artifacts
+
+Every OpenTouch checkpoint has a sibling directory with `normalization.npz`,
+`data_contract.json`, and `split_manifest.json`. Their SHA-256 hashes are stored
+inside the model checkpoint. Loading verifies file integrity and training
+resume additionally compares the sidecars with the current dataset.
