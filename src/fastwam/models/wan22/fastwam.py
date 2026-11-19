@@ -127,14 +127,18 @@ class FastWAM(torch.nn.Module):
             num_train_timesteps=action_num_train_timesteps,
             shift=action_infer_shift,
         )
-        self.train_force_scheduler = WanContinuousFlowMatchScheduler(
-            num_train_timesteps=force_num_train_timesteps,
-            shift=force_train_shift,
-        )
-        self.infer_force_scheduler = WanContinuousFlowMatchScheduler(
-            num_train_timesteps=force_num_train_timesteps,
-            shift=force_infer_shift,
-        )
+        if self.force_expert is not None:
+            self.train_force_scheduler = WanContinuousFlowMatchScheduler(
+                num_train_timesteps=force_num_train_timesteps,
+                shift=force_train_shift,
+            )
+            self.infer_force_scheduler = WanContinuousFlowMatchScheduler(
+                num_train_timesteps=force_num_train_timesteps,
+                shift=force_infer_shift,
+            )
+        else:
+            self.train_force_scheduler = None
+            self.infer_force_scheduler = None
         # Optional aliases for consistency with Wan22Core naming.
         self.train_scheduler = self.train_video_scheduler
         self.infer_scheduler = self.infer_video_scheduler
@@ -144,10 +148,111 @@ class FastWAM(torch.nn.Module):
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
         self.loss_lambda_force = float(loss_lambda_force)
+        self.experiment_mode = "force" if self.force_expert is not None else "baseline"
+        self.initialization_mode = "wan_actiondit"
+        self.initialization_checkpoint = None
+        self.initialization_source_step = None
+        self.proprio_initialization = "random_canonical"
         self.compile_training_denoise = bool(compile_training_denoise)
         self.mot.compile_training_layers = self.compile_training_denoise
 
         self.to(self.device)
+
+    @staticmethod
+    def _checkpoint_experiment_mode(payload: Mapping[str, Any]) -> Optional[str]:
+        mode = payload.get("experiment_mode")
+        if mode in {"force", "baseline"}:
+            return str(mode)
+        if "force_meta" in payload:
+            return "force"
+        mot_state = payload.get("mot")
+        if isinstance(mot_state, Mapping):
+            if any(
+                str(key).startswith(("force_expert.", "force_va_gates."))
+                for key in mot_state
+            ):
+                return "force"
+            return "baseline"
+        return None
+
+    def set_initialization_metadata(
+        self,
+        *,
+        mode: str,
+        checkpoint: Optional[str] = None,
+        source_step: Optional[int] = None,
+    ) -> None:
+        if mode not in {"wan_actiondit", "official_fastwam", "unknown_legacy"}:
+            raise ValueError(f"Unsupported initialization mode: {mode}")
+        self.initialization_mode = mode
+        self.initialization_checkpoint = checkpoint
+        self.initialization_source_step = source_step
+
+    def initialize_from_official_fastwam(self, path: str | Path) -> Mapping[str, Any]:
+        """Strictly initialize only the standard Video/Action MoT experts.
+
+        OpenTouch proprio and all force-specific parameters deliberately retain
+        their fresh initialization because their input semantics/architecture are
+        not part of the official two-expert checkpoint contract.
+        """
+        payload = torch.load(path, map_location="cpu")
+        if "mot" not in payload:
+            if "dit" in payload:
+                raise ValueError(
+                    "Official FastWAM initialization requires a standard `mot` checkpoint; "
+                    "legacy/pure-video `dit` checkpoints are not supported."
+                )
+            raise ValueError(f"Official FastWAM checkpoint has no `mot` state: {path}")
+        if payload.get("experiment_mode") == "force" or "force_meta" in payload:
+            raise ValueError("A force experiment checkpoint cannot be used as official FastWAM initialization.")
+
+        source_state = payload["mot"]
+        if not isinstance(source_state, Mapping):
+            raise TypeError("Official checkpoint `mot` must be a state-dict mapping.")
+        force_prefixes = ("force_expert.", "force_va_gates.")
+        source_force_keys = [
+            key for key in source_state if str(key).startswith(force_prefixes)
+        ]
+        if source_force_keys:
+            raise ValueError(
+                "Official initialization checkpoint contains force parameters: "
+                f"{source_force_keys[:5]}"
+            )
+
+        target_state = self.mot.state_dict()
+        expected_keys = {
+            key for key in target_state if not str(key).startswith(force_prefixes)
+        }
+        source_keys = set(source_state)
+        missing = sorted(expected_keys - source_keys)
+        unexpected = sorted(source_keys - expected_keys)
+        shape_mismatch = sorted(
+            key
+            for key in expected_keys & source_keys
+            if tuple(target_state[key].shape) != tuple(source_state[key].shape)
+        )
+        if missing or unexpected or shape_mismatch:
+            raise ValueError(
+                "Official FastWAM checkpoint is not the standard compatible Video+Action MoT: "
+                f"missing={missing[:10]}, unexpected={unexpected[:10]}, "
+                f"shape_mismatch={shape_mismatch[:10]}"
+            )
+
+        merged_state = dict(target_state)
+        merged_state.update(source_state)
+        self.mot.load_state_dict(merged_state, strict=True)
+        self.set_initialization_metadata(
+            mode="official_fastwam",
+            checkpoint=str(Path(path).resolve()),
+            source_step=(None if payload.get("step") is None else int(payload["step"])),
+        )
+        logger.info(
+            "Initialized %d Video/Action MoT tensors from official FastWAM checkpoint %s; "
+            "OpenTouch proprio and force tensors remain freshly initialized.",
+            len(source_state),
+            path,
+        )
+        return payload
 
     @classmethod
     def from_wan22_pretrained(
@@ -1748,15 +1853,23 @@ class FastWAM(torch.nn.Module):
         optimizer=None,
         step=None,
         data_artifact_hashes: Optional[Mapping[str, str]] = None,
+        training_metadata: Optional[Mapping[str, Any]] = None,
     ):
         payload = {
             "mot": self.mot.state_dict(),
             # Preserve compatibility for non-OpenTouch tasks that do not
             # provide data sidecars.
-            "schema_version": 3 if data_artifact_hashes is not None else 2,
+            "schema_version": 4 if data_artifact_hashes is not None else 2,
             "step": step,
             "torch_dtype": str(self.torch_dtype),
+            "experiment_mode": self.experiment_mode,
+            "initialization_mode": self.initialization_mode,
+            "initialization_checkpoint": self.initialization_checkpoint,
+            "initialization_source_step": self.initialization_source_step,
+            "proprio_initialization": self.proprio_initialization,
         }
+        if training_metadata is not None:
+            payload.update(dict(training_metadata))
         if self.force_expert is not None:
             payload["force_meta"] = {
                 "history_steps": self.force_expert.history_steps,
@@ -1777,8 +1890,18 @@ class FastWAM(torch.nn.Module):
         path,
         optimizer=None,
         data_artifact_dir: Optional[str] = None,
+        strict_experiment_mode: bool = False,
     ):
         payload = torch.load(path, map_location="cpu")
+        checkpoint_mode = self._checkpoint_experiment_mode(payload)
+        if strict_experiment_mode:
+            if checkpoint_mode is None:
+                raise ValueError(f"Cannot infer experiment mode from checkpoint: {path}")
+            if checkpoint_mode != self.experiment_mode:
+                raise ValueError(
+                    f"Checkpoint experiment_mode={checkpoint_mode!r} does not match "
+                    f"model experiment_mode={self.experiment_mode!r}."
+                )
         expected_artifact_hashes = payload.get("data_artifact_hashes")
         if expected_artifact_hashes is not None:
             artifact_dir = (
@@ -1793,7 +1916,9 @@ class FastWAM(torch.nn.Module):
                 f"Checkpoint schema_version={payload.get('schema_version')} has no data_artifact_hashes"
             )
         if "mot" in payload:
-            incompatible = self.mot.load_state_dict(payload["mot"], strict=False)
+            incompatible = self.mot.load_state_dict(
+                payload["mot"], strict=bool(strict_experiment_mode)
+            )
             if incompatible.missing_keys:
                 logger.warning(
                     "Checkpoint is missing %d MoT keys (expected for official checkpoints without ForceExpert): %s",
@@ -1821,6 +1946,12 @@ class FastWAM(torch.nn.Module):
 
         if optimizer is not None and "optimizer" in payload:
             optimizer.load_state_dict(payload["optimizer"])
+        self.initialization_mode = str(payload.get("initialization_mode", "unknown_legacy"))
+        self.initialization_checkpoint = payload.get("initialization_checkpoint")
+        self.initialization_source_step = payload.get("initialization_source_step")
+        self.proprio_initialization = str(
+            payload.get("proprio_initialization", "unknown_legacy")
+        )
         return payload
 
     def forward(self, *args, **kwargs):

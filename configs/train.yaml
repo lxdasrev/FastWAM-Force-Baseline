@@ -2,6 +2,7 @@
 
 defaults:
   - _self_
+  - initialization: wan_actiondit
   - data: null
   - model: null
   - task: null

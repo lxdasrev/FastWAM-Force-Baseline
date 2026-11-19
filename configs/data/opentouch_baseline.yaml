@@ -1,0 +1,47 @@
+train:
+  _target_: fastwam.datasets.opentouch.OpenTouchDataset
+  include_force: false
+  raw_data_root: //wsl$/Ubuntu2204/home/lxd/code/embodyaicode/opentouch/opentouch-main/data
+  cache_root: ./data/opentouch_fastwam_cache
+  split: train
+  split_seed: 42
+  split_ratios: [0.8, 0.1, 0.1]
+  video_size: [224, 224]
+  history_steps: 16
+  future_steps: 32
+  video_stride: 4
+  workspace_scale_m: 0.30
+  smoothing_window: 5
+  max_delta_translation_m: 0.05
+  max_delta_rotation_rad: 0.50
+  compute_force_stats: false
+  normalize_action_proprio: true
+  strict_schema: true
+  prompt_template: "Manipulate the object: {task}"
+  sample_rate_hz: 30.0
+  gripper_closed_ratio: 0.18
+  gripper_open_ratio: 1.35
+
+val:
+  _target_: fastwam.datasets.opentouch.OpenTouchDataset
+  include_force: false
+  raw_data_root: ${data.train.raw_data_root}
+  cache_root: ${data.train.cache_root}
+  split: val
+  split_seed: ${data.train.split_seed}
+  split_ratios: ${data.train.split_ratios}
+  video_size: ${data.train.video_size}
+  history_steps: ${data.train.history_steps}
+  future_steps: ${data.train.future_steps}
+  video_stride: ${data.train.video_stride}
+  workspace_scale_m: ${data.train.workspace_scale_m}
+  smoothing_window: ${data.train.smoothing_window}
+  max_delta_translation_m: ${data.train.max_delta_translation_m}
+  max_delta_rotation_rad: ${data.train.max_delta_rotation_rad}
+  compute_force_stats: false
+  normalize_action_proprio: true
+  strict_schema: true
+  prompt_template: ${data.train.prompt_template}
+  sample_rate_hz: ${data.train.sample_rate_hz}
+  gripper_closed_ratio: ${data.train.gripper_closed_ratio}
+  gripper_open_ratio: ${data.train.gripper_open_ratio}

@@ -14,6 +14,7 @@ from omegaconf import OmegaConf
 from .trainer import Wan22Trainer
 from .utils.logging_config import get_logger, setup_logging
 from .utils.video_io import save_mp4
+from .utils.pytorch_utils import set_global_seed
 from .utils import misc
 
 logger = get_logger(__name__)
@@ -134,15 +135,18 @@ def create_fastwam(
             "Expected keys: train_shift, infer_shift, num_train_timesteps."
         )
 
-    if isinstance(force_scheduler, DictConfig):
-        force_scheduler = OmegaConf.to_container(force_scheduler, resolve=True)
-    if force_scheduler is None:
-        force_scheduler = dict(action_scheduler)
-    if not isinstance(force_scheduler, dict):
-        raise ValueError(f"`force_scheduler` must be dict-like, got {type(force_scheduler)}")
-    missing_force_keys = required_action_scheduler_keys - set(force_scheduler.keys())
-    if missing_force_keys:
-        raise ValueError(f"`force_scheduler` missing required keys: {sorted(missing_force_keys)}")
+    if force_dit_config is not None:
+        if isinstance(force_scheduler, DictConfig):
+            force_scheduler = OmegaConf.to_container(force_scheduler, resolve=True)
+        if force_scheduler is None:
+            force_scheduler = dict(action_scheduler)
+        if not isinstance(force_scheduler, dict):
+            raise ValueError(f"`force_scheduler` must be dict-like, got {type(force_scheduler)}")
+        missing_force_keys = required_action_scheduler_keys - set(force_scheduler.keys())
+        if missing_force_keys:
+            raise ValueError(f"`force_scheduler` missing required keys: {sorted(missing_force_keys)}")
+    else:
+        force_scheduler = {}
 
     if isinstance(loss, DictConfig):
         loss = OmegaConf.to_container(loss, resolve=True)
@@ -172,9 +176,9 @@ def create_fastwam(
         action_train_shift=float(action_scheduler["train_shift"]),
         action_infer_shift=float(action_scheduler["infer_shift"]),
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
-        force_train_shift=float(force_scheduler["train_shift"]),
-        force_infer_shift=float(force_scheduler["infer_shift"]),
-        force_num_train_timesteps=int(force_scheduler["num_train_timesteps"]),
+        force_train_shift=float(force_scheduler.get("train_shift", 1.0)),
+        force_infer_shift=float(force_scheduler.get("infer_shift", 1.0)),
+        force_num_train_timesteps=int(force_scheduler.get("num_train_timesteps", 1000)),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
         loss_lambda_force=float(loss.get("lambda_force", 0.25)),
@@ -504,8 +508,45 @@ def run_training(cfg: DictConfig):
     model_device = _resolve_train_device()
     mixed_precision = _normalize_mixed_precision(cfg.mixed_precision)
     model_dtype = _mixed_precision_to_model_dtype(mixed_precision)
-    model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
+    # Random OpenTouch proprio/Force parameters must be reproducible and
+    # identical across ranks before DDP/DeepSpeed wraps the model.
+    set_global_seed(int(cfg.seed))
+    initialization_cfg = cfg.get("initialization") or {}
+    initialization_mode = str(initialization_cfg.get("mode", "wan_actiondit"))
+    if initialization_mode not in {"wan_actiondit", "official_fastwam"}:
+        raise ValueError(f"Unsupported initialization.mode={initialization_mode!r}")
+    skip_base_preload = bool(cfg.get("resume")) or initialization_mode == "official_fastwam"
+    model = instantiate(
+        cfg.model,
+        model_dtype=model_dtype,
+        device=model_device,
+        skip_dit_load_from_pretrain=skip_base_preload,
+    )
+    if not cfg.get("resume"):
+        if initialization_mode == "official_fastwam":
+            checkpoint_path = initialization_cfg.get("checkpoint_path")
+            if not checkpoint_path:
+                raise ValueError(
+                    "initialization.checkpoint_path is required for official_fastwam initialization."
+                )
+            if not Path(str(checkpoint_path)).is_file():
+                raise FileNotFoundError(
+                    f"Official FastWAM initialization checkpoint not found: {checkpoint_path}"
+                )
+            if not hasattr(model, "initialize_from_official_fastwam"):
+                raise TypeError("Selected model does not support official FastWAM initialization.")
+            model.initialize_from_official_fastwam(str(checkpoint_path))
+        elif hasattr(model, "set_initialization_metadata"):
+            model.set_initialization_metadata(mode="wan_actiondit")
     train_ds, val_ds = build_datasets(cfg.data)
+
+    model_uses_force = getattr(model, "force_expert", None) is not None
+    for name, dataset in (("train", train_ds), ("val", val_ds)):
+        if hasattr(dataset, "include_force") and bool(dataset.include_force) != model_uses_force:
+            raise ValueError(
+                f"OpenTouch {name} dataset include_force={dataset.include_force} does not match "
+                f"model force_expert enabled={model_uses_force}."
+            )
 
     trainer = Wan22Trainer(
         cfg=cfg,
@@ -527,10 +568,12 @@ def run_inference(cfg: DictConfig):
         ckpt = Path(checkpoint_path)
         if ckpt.exists():
             logger.info("Loading finetuned checkpoint: %s", checkpoint_path)
-            model.load_checkpoint(
-                checkpoint_path,
-                data_artifact_dir=inference_cfg.get("data_artifact_dir"),
-            )
+            load_kwargs = {
+                "data_artifact_dir": inference_cfg.get("data_artifact_dir"),
+            }
+            if "strict_experiment_mode" in inspect.signature(model.load_checkpoint).parameters:
+                load_kwargs["strict_experiment_mode"] = True
+            model.load_checkpoint(checkpoint_path, **load_kwargs)
         else:
             logger.warning("Checkpoint not found, skipping load: %s", checkpoint_path)
     model.eval()

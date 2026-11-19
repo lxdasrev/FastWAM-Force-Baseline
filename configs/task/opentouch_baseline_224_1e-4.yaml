@@ -1,0 +1,27 @@
+# @package _global_
+
+defaults:
+  - override /data: opentouch_baseline
+  - override /model: fastwam_opentouch_baseline
+  - _self_
+
+batch_size: 1
+num_workers: 4
+learning_rate: 1.0e-4
+pretrained_learning_rate: 1.0e-5
+num_epochs: 1
+max_steps: 10000
+joint_training_steps: 10000
+log_every: 10
+save_every: 2000
+eval_every: 500
+eval_num_inference_steps: 10
+gradient_accumulation_steps: 1
+force_warmup_steps: 0
+force_ablation_every: 0
+train_video_expert: true
+allow_data_contract_mismatch: false
+weight_decay: 1.0e-2
+max_grad_norm: 1.0
+mixed_precision: bf16
+resume: null

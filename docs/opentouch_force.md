@@ -1,4 +1,4 @@
-# OpenTouch ForceExpert
+# OpenTouch two-/three-expert experiments
 
 This extension trains FastWAM directly from the raw OpenTouch HDF5 directory.
 The HDF5 files are never modified. The dataset writes versioned numeric episode
@@ -20,18 +20,35 @@ are canonical task-space pseudo robot actions. A robot-specific frame transform,
 controller, limits, collision checking and real-robot fine-tuning are still
 required before hardware deployment.
 
+## Dataset modes
+
+Both tasks use the same HDF5 files, file-level split, anchor history and window
+indices. `OpenTouchDataset(include_force=false)` reads only RGB and hand
+landmarks and never accesses `right_pressure`; its samples, caches and
+normalization artifacts contain no force fields. `include_force=true` adds the
+existing `[49,2]` force data. Both modes use the same prompt text.
+
 ## Train
 
 Install the project dependencies, including `h5py`, then run the normal FastWAM
 training entry point with:
 
 ```bash
-python scripts/train.py task=opentouch_force_224_1e-4
+python scripts/train.py task=opentouch_baseline_224_1e-4 initialization=wan_actiondit
+python scripts/train.py task=opentouch_force_224_1e-4 initialization=wan_actiondit
 ```
 
+Use `initialization=official_fastwam` together with
+`initialization.checkpoint_path=/path/to/official_fastwam.pt` to initialize the
+Video/Action MoT from an official standard checkpoint. OpenTouch canonical
+proprio is always freshly initialized because the official LIBERO 8D input has
+different semantics. Force parameters are also freshly initialized in the
+three-expert task.
+
 The first startup scans the raw files, builds the deterministic source-file
-split, computes train-only force/action/proprio statistics and creates episode
-caches. Later runs reuse those files.
+split, computes train-only action/proprio statistics (plus force statistics
+only when enabled) and creates mode-specific episode caches. Later runs reuse
+those files.
 
 The default ForceExpert uses 10 blocks and the bridge mapping:
 
@@ -85,8 +102,8 @@ or plot is written. Online robot inference has no future ground truth, so this
 comparison is available only for held-out/offline samples; real task success
 must still be measured by robot rollouts.
 
-Use `OpenTouchForceDataset.denormalize_action` and
-`OpenTouchForceDataset.denormalize_force` with the same cache/configuration
+Use `OpenTouchDataset.denormalize_action` and, in force mode,
+`OpenTouchDataset.denormalize_force` with the same cache/configuration
 before interpreting outputs. Execute only a short prefix and replan from new
 visual, proprioceptive and tactile observations.
 
@@ -117,17 +134,23 @@ the number of devices listed in `CUDA_VISIBLE_DEVICES`:
 
 ```bash
 CUDA_VISIBLE_DEVICES=2 \
-bash scripts/train_zero2.sh 1 task=opentouch_force_224_1e-4
+bash scripts/train_zero2.sh 1 task=opentouch_baseline_224_1e-4 \
+  initialization=wan_actiondit
 
 CUDA_VISIBLE_DEVICES=1,3,5,7 \
 bash scripts/train_zero2.sh 4 task=opentouch_force_224_1e-4 \
+  initialization=official_fastwam \
+  initialization.checkpoint_path=/path/to/official_fastwam.pt \
   gradient_accumulation_steps=4
 ```
 
 `batch_size` is per GPU, so the effective batch is `batch_size * world_size *
 gradient_accumulation_steps`. The task configuration uses a 1,000-step Force
-warmup and a 10,000-step joint pilot by default. Use `max_steps=200` for a
-smoke run. Data-contract mismatches are fatal unless the explicit diagnostic
+warmup and a 10,000-step joint pilot by default. The baseline runs 10,000 joint
+steps without warmup. For a force smoke run use
+`force_warmup_steps=50 joint_training_steps=150 max_steps=200`; for a baseline
+smoke run use `joint_training_steps=200 max_steps=200`. Data-contract
+mismatches are fatal unless the explicit diagnostic
 override `allow_data_contract_mismatch=true` is supplied.
 For a lower-memory single-GPU pilot, add `train_video_expert=false`; this is an
 explicit choice and the trainer never changes it silently.
@@ -138,3 +161,23 @@ Every OpenTouch checkpoint has a sibling directory with `normalization.npz`,
 `data_contract.json`, and `split_manifest.json`. Their SHA-256 hashes are stored
 inside the model checkpoint. Loading verifies file integrity and training
 resume additionally compares the sidecars with the current dataset.
+
+## Offline evaluation
+
+Evaluate either mode with the same fixed-index interface:
+
+```bash
+python scripts/eval_opentouch.py \
+  task=opentouch_baseline_224_1e-4 \
+  checkpoint_path=/path/to/step_010000.pt
+
+python scripts/eval_opentouch.py \
+  task=opentouch_force_224_1e-4 \
+  checkpoint_path=/path/to/step_011000.pt \
+  split=test num_samples=null
+```
+
+The evaluator strictly checks checkpoint mode, uses `infer_action` for the
+baseline and `infer_action_force` for the force task, and writes per-sample and
+aggregate action metrics to JSON. Force metrics are added only for the
+three-expert task.

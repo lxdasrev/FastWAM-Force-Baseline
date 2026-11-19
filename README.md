@@ -1,7 +1,8 @@
 # FastWAM
 
-OpenTouch two-finger tactile training and the sparse ForceExpert extension are
-documented in [docs/opentouch_force.md](docs/opentouch_force.md).
+OpenTouch two-expert visual baselines, three-expert tactile training and their
+initialization/evaluation commands are documented in
+[docs/opentouch_force.md](docs/opentouch_force.md).
 
 Official codebase for **Fast-WAM: Do World Action Models Need Test-time Future Imagination?**
 

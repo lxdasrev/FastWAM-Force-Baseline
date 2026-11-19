@@ -1,0 +1,25 @@
+# @package _global_
+
+defaults:
+  - _self_
+  - data: null
+  - model: null
+  - task: null
+
+checkpoint_path: null
+data_artifact_dir: null
+split: val
+num_samples: 100
+sample_seed: 42
+num_inference_steps: 10
+device: cuda
+mixed_precision: bf16
+output_dir: ./eval/opentouch
+output_json: metrics.json
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null

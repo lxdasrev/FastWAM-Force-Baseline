@@ -16,7 +16,7 @@ from PIL import Image
 from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 
-from .datasets.opentouch.metrics import compute_opentouch_inference_metrics
+from .datasets.opentouch.evaluation import infer_opentouch_sample
 from .datasets.opentouch.contract import artifact_hashes
 from .utils.fs import ensure_dir
 from .utils.logging_config import get_logger, setup_logging
@@ -53,12 +53,36 @@ class Wan22Trainer:
         self.max_grad_norm = float(cfg.max_grad_norm)
         self.seed = int(cfg.seed)
         self.force_warmup_steps = int(cfg.get("force_warmup_steps", 0))
+        self.joint_training_steps = int(
+            cfg.get(
+                "joint_training_steps",
+                0 if self.max_steps is None else self.max_steps - self.force_warmup_steps,
+            )
+        )
         self.train_video_expert = bool(cfg.get("train_video_expert", True))
         self.allow_data_contract_mismatch = bool(
             cfg.get("allow_data_contract_mismatch", False)
         )
         self.force_ablation_every = int(cfg.get("force_ablation_every", 2000))
         self._active_training_stage = None
+
+        model_uses_force = getattr(self.model, "force_expert", None) is not None
+        for name, dataset in (("train", self.train_dataset), ("val", self.val_dataset)):
+            if dataset is not None and hasattr(dataset, "include_force"):
+                if bool(dataset.include_force) != model_uses_force:
+                    raise ValueError(
+                        f"OpenTouch {name} dataset include_force={dataset.include_force} does not match "
+                        f"model force_expert enabled={model_uses_force}."
+                    )
+        if not model_uses_force and self.force_warmup_steps != 0:
+            raise ValueError("force_warmup_steps must be 0 for the two-expert baseline.")
+        if self.max_steps is not None and self.joint_training_steps > 0:
+            expected_steps = self.force_warmup_steps + self.joint_training_steps
+            if self.max_steps != expected_steps:
+                raise ValueError(
+                    f"max_steps={self.max_steps} must equal force_warmup_steps + "
+                    f"joint_training_steps={expected_steps}."
+                )
         
         self.resume = cfg.resume
         self.mixed_precision = str(cfg.mixed_precision).strip().lower()
@@ -146,13 +170,17 @@ class Wan22Trainer:
         self.train_loader = self._build_loader(self.train_dataset, worker_init_fn=worker_init_fn)
         total_train_steps = self._estimate_total_train_steps()
         self.max_steps = total_train_steps
-        warmup_steps = int(total_train_steps * 0.05)
+        scheduler_train_steps = (
+            self.joint_training_steps if self.joint_training_steps > 0 else total_train_steps
+        )
+        warmup_steps = int(scheduler_train_steps * 0.05)
         self.scheduler = self._build_scheduler(
             scheduler_type=cfg.lr_scheduler_type,
-            total_train_steps=total_train_steps,
+            total_train_steps=scheduler_train_steps,
             warmup_steps=warmup_steps,
         )
         self.global_step = 0
+        self.joint_step = 0
         self.epoch = 0
         self.batch_in_epoch = 0
 
@@ -361,12 +389,31 @@ class Wan22Trainer:
         logger.info("Loading weight checkpoint only: %s", resume)
         checkpoint_artifact_dir = resume_path.with_suffix("")
         self._validate_checkpoint_artifacts(checkpoint_artifact_dir)
-        self.accelerator.unwrap_model(self.model).load_checkpoint(
+        payload = self.accelerator.unwrap_model(self.model).load_checkpoint(
             str(resume_path),
             optimizer=None,
             data_artifact_dir=str(checkpoint_artifact_dir),
+            strict_experiment_mode=True,
         )
-        logger.warning("Loaded .pt weights only; optimizer/scheduler/step were not restored under ZeRO2.")
+        restored_step = payload.get("global_step", payload.get("step"))
+        if restored_step is not None:
+            self.global_step = int(restored_step)
+            self.joint_step = int(
+                payload.get("joint_step", max(0, self.global_step - self.force_warmup_steps))
+            )
+            saved_phase = payload.get("phase")
+            derived_phase = self._training_phase()
+            if saved_phase is not None and saved_phase != derived_phase:
+                raise ValueError(
+                    f"Training state phase={saved_phase!r} is inconsistent with "
+                    f"global_step={self.global_step} and configured warmup; expected {derived_phase!r}."
+                )
+        logger.warning(
+            "Loaded .pt weights at global_step=%d joint_step=%d; optimizer/scheduler state was not restored. "
+            "Use a checkpoint/state directory for an exact training resume.",
+            self.global_step,
+            self.joint_step,
+        )
 
     def _validate_checkpoint_artifacts(self, artifact_dir: str | Path) -> None:
         if not hasattr(self.train_dataset, "validate_data_artifacts"):
@@ -405,6 +452,12 @@ class Wan22Trainer:
             train_video_expert=self.train_video_expert,
             force_warmup=force_warmup,
         )
+
+    def _training_phase(self) -> str:
+        model = self.accelerator.unwrap_model(self.model)
+        if getattr(model, "force_expert", None) is not None and self.global_step < self.force_warmup_steps:
+            return "force_warmup"
+        return "joint"
 
     @staticmethod
     def _apply_dit_only_train_mode(
@@ -550,6 +603,75 @@ class Wan22Trainer:
             and hasattr(self.val_dataset, "denormalize_force")
         )
 
+    def _is_opentouch_action_eval(self, model, sample) -> bool:
+        return bool(
+            sample.get("force") is None
+            and getattr(model, "force_expert", None) is None
+            and hasattr(model, "infer_action")
+            and hasattr(self.val_dataset, "denormalize_action")
+            and hasattr(self.val_dataset, "include_force")
+        )
+
+    @torch.no_grad()
+    def _evaluate_opentouch_action(
+        self,
+        *,
+        model,
+        sample,
+        eval_index: int,
+        val_loss: float,
+        val_loss_dict: dict,
+        was_dit_training: bool,
+    ) -> dict[str, float | str]:
+        with self.accelerator.autocast():
+            inference = infer_opentouch_sample(
+                model=model,
+                dataset=self.val_dataset,
+                sample=sample,
+                num_inference_steps=self.eval_num_inference_steps,
+                seed=int(self.seed + eval_index),
+            )
+        local_metrics = dict(inference["metrics"])
+        local_metrics.update(
+            {
+                "val_loss": float(val_loss),
+                "val_loss_video": float(val_loss_dict.get("loss_video", float("nan"))),
+                "val_loss_action": float(val_loss_dict.get("loss_action", float("nan"))),
+            }
+        )
+        metric_names = [
+            "val_loss",
+            "val_loss_video",
+            "val_loss_action",
+            "action_mae",
+            "action_rmse",
+            "action_translation_mae_m",
+            "action_rotation_mae_rad",
+            "action_gripper_mae",
+        ]
+        gathered = self.accelerator.gather_for_metrics(
+            torch.tensor(
+                [local_metrics[name] for name in metric_names],
+                device=self.accelerator.device,
+                dtype=torch.float32,
+            ).unsqueeze(0)
+        )
+        means = torch.nanmean(gathered, dim=0).cpu().tolist()
+        result: dict[str, float | str] = {
+            name: float(value) for name, value in zip(metric_names, means)
+        }
+        result["eval_mode"] = "opentouch_action"
+        if self.accelerator.is_main_process:
+            logger.info(
+                "[eval-opentouch-action] index=%d prompt=%r action_mae=%.6f",
+                eval_index,
+                sample["prompt"][0],
+                result["action_mae"],
+            )
+        if was_dit_training:
+            self._set_dit_only_train_mode()
+        return result
+
     @staticmethod
     def _format_metric_vector(values: np.ndarray) -> str:
         return "[" + ", ".join(f"{float(value):.5f}" for value in np.asarray(values).reshape(-1)) + "]"
@@ -565,79 +687,30 @@ class Wan22Trainer:
         val_loss_dict: dict,
         was_dit_training: bool,
     ) -> dict[str, float | str]:
-        video0 = sample["video"][0]
-        gt_action_norm = sample["action"][0]
-        proprio = sample["proprio"][0, 0]
-        force = sample["force"][0]
         observed_steps = int(model.force_expert.observed_steps)
-        gt_force_norm = force[observed_steps:]
-        force_history = force[:observed_steps]
-        history_valid = sample.get("force_valid")
-        if history_valid is None:
-            history_valid = torch.ones_like(force_history, dtype=torch.bool)
-        else:
-            history_valid = history_valid[0, :observed_steps]
-        history_is_pad = sample.get("force_is_pad")
-        if history_is_pad is not None:
-            history_is_pad = history_is_pad[0, :observed_steps]
-
-        infer_kwargs = {
-            "input_image": video0[:, 0],
-            "force_history": force_history,
-            "force_history_valid": history_valid,
-            "force_history_is_pad": history_is_pad,
-            "action_horizon": int(gt_action_norm.shape[0]),
-            "proprio": proprio,
-            "num_inference_steps": self.eval_num_inference_steps,
-            "seed": int(self.seed + eval_index),
-            "tiled": False,
-        }
-        if sample["context"] is not None:
-            infer_kwargs["prompt"] = None
-            infer_kwargs["context"] = sample["context"][0]
-            infer_kwargs["context_mask"] = sample["context_mask"][0]
-        else:
-            infer_kwargs["prompt"] = sample["prompt"][0]
-
         with self.accelerator.autocast():
-            pred = model.infer_action_force(**infer_kwargs)
-
-        pred_action_norm = pred["action"].detach().cpu().numpy()
-        pred_force_norm = pred["future_force"].detach().cpu().numpy()
-        gt_action_norm_np = gt_action_norm.detach().cpu().numpy()
-        gt_force_norm_np = gt_force_norm.detach().cpu().numpy()
-
-        pred_action = self.val_dataset.denormalize_action(pred_action_norm)
-        gt_action = self.val_dataset.denormalize_action(gt_action_norm_np)
-        pred_force = self.val_dataset.denormalize_force(pred_force_norm)
-        gt_force = self.val_dataset.denormalize_force(gt_force_norm_np)
-
-        action_is_pad = sample.get("action_is_pad")
-        if action_is_pad is None:
-            action_valid = np.ones((gt_action.shape[0],), dtype=bool)
-        else:
-            action_valid = ~action_is_pad[0].detach().cpu().numpy().astype(bool)
-
-        force_valid_tensor = sample.get("force_valid")
-        if force_valid_tensor is None:
-            force_valid = np.ones_like(gt_force, dtype=bool)
-        else:
-            force_valid = force_valid_tensor[0, observed_steps:].detach().cpu().numpy().astype(bool)
-        force_is_pad = sample.get("force_is_pad")
-        if force_is_pad is not None:
-            force_valid &= ~force_is_pad[0, observed_steps:].detach().cpu().numpy().astype(bool)[:, None]
-
-        local_metrics = compute_opentouch_inference_metrics(
-            pred_action=pred_action,
-            gt_action=gt_action,
-            action_valid=action_valid,
-            pred_force=pred_force,
-            gt_force=gt_force,
-            force_valid=force_valid,
-        )
+            inference = infer_opentouch_sample(
+                model=model,
+                dataset=self.val_dataset,
+                sample=sample,
+                num_inference_steps=self.eval_num_inference_steps,
+                seed=int(self.seed + eval_index),
+            )
+        local_metrics = dict(inference["metrics"])
+        pred_action = inference["pred_action"]
+        gt_action = inference["gt_action"]
+        action_valid = inference["action_valid"]
+        pred_force = inference["pred_force"]
+        gt_force = inference["gt_force"]
+        force_valid = inference["force_valid"]
+        infer_kwargs = inference["inference_kwargs"]
+        force_history = infer_kwargs["force_history"]
+        history_valid = infer_kwargs["force_history_valid"]
+        history_is_pad = infer_kwargs["force_history_is_pad"]
         run_ablations = bool(
             self.force_ablation_every > 0
-            and self.global_step % self.force_ablation_every == 0
+            and self.joint_step > 0
+            and self.joint_step % self.force_ablation_every == 0
         )
         ablation_step_gains: dict[str, np.ndarray] = {}
         if run_ablations:
@@ -846,7 +919,9 @@ class Wan22Trainer:
         # Each rank owns one stable validation window.  The set no longer
         # changes with global_step, so model comparisons use identical data.
         eval_index = (self.seed + self.accelerator.process_index) % len(self.val_dataset)
-        if hasattr(self.val_dataset, "find_contact_window"):
+        if bool(getattr(self.val_dataset, "include_force", False)) and hasattr(
+            self.val_dataset, "find_contact_window"
+        ):
             eval_index = self.val_dataset.find_contact_window(eval_index)
         sample = self._to_batched_eval_sample(self.val_dataset[eval_index])
 
@@ -858,7 +933,8 @@ class Wan22Trainer:
         if self._is_opentouch_force_eval(model, sample):
             run_generation = bool(
                 self.force_ablation_every > 0
-                and self.global_step % self.force_ablation_every == 0
+                and self.joint_step > 0
+                and self.joint_step % self.force_ablation_every == 0
             )
             if not run_generation:
                 metric_names = [
@@ -903,6 +979,15 @@ class Wan22Trainer:
                     self._set_dit_only_train_mode()
                 return result
             return self._evaluate_opentouch_force(
+                model=model,
+                sample=sample,
+                eval_index=eval_index,
+                val_loss=val_loss,
+                val_loss_dict=val_loss_dict,
+                was_dit_training=was_dit_training,
+            )
+        if self._is_opentouch_action_eval(model, sample):
+            return self._evaluate_opentouch_action(
                 model=model,
                 sample=sample,
                 eval_index=eval_index,
@@ -1093,6 +1178,11 @@ class Wan22Trainer:
             optimizer=None,
             step=self.global_step,
             data_artifact_hashes=checkpoint_artifact_hashes,
+            training_metadata={
+                "global_step": int(self.global_step),
+                "joint_step": int(self.joint_step),
+                "phase": self._training_phase(),
+            },
         )
         return ckpt_path
 
@@ -1112,11 +1202,19 @@ class Wan22Trainer:
 
     def _save_trainer_state(self, state_path: str):
         state_file = os.path.join(state_path, "trainer_state.json")
+        model = self.accelerator.unwrap_model(self.model)
         payload = {
             "global_step": int(self.global_step),
+            "joint_step": int(self.joint_step),
+            "phase": self._training_phase(),
             "epoch": int(self.epoch),
             "batch_in_epoch": int(self.batch_in_epoch),
             "data_artifact_hashes": self.data_artifact_hashes,
+            "experiment_mode": getattr(model, "experiment_mode", None),
+            "initialization_mode": getattr(model, "initialization_mode", "unknown_legacy"),
+            "initialization_checkpoint": getattr(model, "initialization_checkpoint", None),
+            "initialization_source_step": getattr(model, "initialization_source_step", None),
+            "proprio_initialization": getattr(model, "proprio_initialization", "unknown_legacy"),
         }
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
@@ -1144,12 +1242,34 @@ class Wan22Trainer:
 
     def load_training_state(self, state_dir: str):
         self._validate_checkpoint_artifacts(state_dir)
-        self.accelerator.load_state(input_dir=state_dir)
         state_file = Path(state_dir) / "trainer_state.json"
+        payload = None
         if state_file.exists():
             with open(state_file, "r", encoding="utf-8") as f:
                 payload = json.load(f)
+            model = self.accelerator.unwrap_model(self.model)
+            saved_mode = payload.get("experiment_mode")
+            if saved_mode is not None and saved_mode != getattr(model, "experiment_mode", None):
+                raise ValueError(
+                    f"Training state experiment_mode={saved_mode!r} does not match "
+                    f"model experiment_mode={getattr(model, 'experiment_mode', None)!r}."
+                )
+        self.accelerator.load_state(input_dir=state_dir)
+        if payload is not None:
             self.global_step = int(payload["global_step"])
+            self.joint_step = int(
+                payload.get("joint_step", max(0, self.global_step - self.force_warmup_steps))
+            )
+            model = self.accelerator.unwrap_model(self.model)
+            if hasattr(model, "set_initialization_metadata"):
+                model.set_initialization_metadata(
+                    mode=str(payload.get("initialization_mode", "unknown_legacy")),
+                    checkpoint=payload.get("initialization_checkpoint"),
+                    source_step=payload.get("initialization_source_step"),
+                )
+                model.proprio_initialization = str(
+                    payload.get("proprio_initialization", "unknown_legacy")
+                )
             expected_hashes = payload.get("data_artifact_hashes")
             if expected_hashes is not None:
                 actual_hashes = artifact_hashes(state_dir)
@@ -1185,6 +1305,7 @@ class Wan22Trainer:
             self.global_step = int(match.group(1))
         else:
             self.global_step = 0
+        self.joint_step = max(0, self.global_step - self.force_warmup_steps)
         self.epoch = 0
         self.batch_in_epoch = 0
         self.train_sampler.clear_resume_batch_offset()
@@ -1229,6 +1350,7 @@ class Wan22Trainer:
                 self.accelerator.backward(loss)
 
                 if self.accelerator.sync_gradients:
+                    completed_joint_update = self._training_phase() == "joint"
                     gate_grad_metrics = {}
                     unwrapped_for_grads = self.accelerator.unwrap_model(self.model)
                     force_va_gates = getattr(unwrapped_for_grads.mot, "force_va_gates", None)
@@ -1240,10 +1362,15 @@ class Wan22Trainer:
                             )
                     grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     self.optimizer.step()
-                    if not self.accelerator.optimizer_step_was_skipped:
+                    if (
+                        not self.accelerator.optimizer_step_was_skipped
+                        and completed_joint_update
+                    ):
                         self.scheduler.step()
                     self.optimizer.zero_grad(set_to_none=True)
                     self.global_step += 1
+                    if completed_joint_update:
+                        self.joint_step += 1
                     global_loss = float(
                         self.accelerator.gather(loss.detach().float().reshape(1)).mean().item()
                     )
@@ -1267,10 +1394,12 @@ class Wan22Trainer:
 
                     if self.log_every > 0 and self.global_step % self.log_every == 0 and self.accelerator.is_main_process:
                         eta_str, steps_per_sec = self._estimate_eta()
-                        description = "[train] epoch=%d step=%d/%d loss=%.4f " % (
+                        description = "[train] epoch=%d step=%d/%d joint_step=%d phase=%s loss=%.4f " % (
                             self.epoch,
                             self.global_step,
                             self.max_steps,
+                            self.joint_step,
+                            self._training_phase(),
                             global_loss,
                         )
                         if global_loss_metrics:
@@ -1288,6 +1417,8 @@ class Wan22Trainer:
                             "train/loss": global_loss,
                             "train/grad_norm": global_grad_norm,
                             "train/lr": current_lr,
+                            "train/global_step": self.global_step,
+                            "train/joint_step": self.joint_step,
                             "performance/steps_per_sec": steps_per_sec,
                             "performance/samples_per_sec": steps_per_sec * self.batch_size * self.accelerator.num_processes,
                         }
@@ -1296,18 +1427,37 @@ class Wan22Trainer:
                         self._wandb_log(wandb_payload)
 
                     if (
-                        self.eval_every > 0
+                        completed_joint_update
+                        and self.eval_every > 0
                         and self.val_dataset is not None
-                        and self.global_step % self.eval_every == 0
+                        and self.joint_step % self.eval_every == 0
                     ):
                         metrics = self.evaluate()
                         self.accelerator.wait_for_everyone()
                         if metrics is not None and self.accelerator.is_main_process:
                             if metrics.get("eval_mode") in {
+                                "opentouch_action",
                                 "opentouch_action_force",
                                 "opentouch_loss_only",
                             }:
-                                if metrics.get("eval_mode") == "opentouch_loss_only":
+                                if metrics.get("eval_mode") == "opentouch_action":
+                                    logger.info(
+                                        "[eval-opentouch-baseline] step=%d joint_step=%d val_loss=%.4f action_mae=%.6f action_rmse=%.6f translation_mae_m=%.6f rotation_mae_rad=%.6f gripper_mae=%.6f",
+                                        self.global_step,
+                                        self.joint_step,
+                                        metrics["val_loss"],
+                                        metrics["action_mae"],
+                                        metrics["action_rmse"],
+                                        metrics["action_translation_mae_m"],
+                                        metrics["action_rotation_mae_rad"],
+                                        metrics["action_gripper_mae"],
+                                    )
+                                    eval_payload = {
+                                        f"eval/{key}": float(value)
+                                        for key, value in metrics.items()
+                                        if key != "eval_mode" and isinstance(value, (int, float))
+                                    }
+                                elif metrics.get("eval_mode") == "opentouch_loss_only":
                                     logger.info(
                                         "[eval-opentouch-loss-only] step=%d val_loss=%.4f video=%.4f action=%.4f force_raw=%.4f force_scheduler_weighted=%.4f force_final=%.4f valid_fraction=%.4f valid_samples=%.1f",
                                         self.global_step,
@@ -1405,7 +1555,11 @@ class Wan22Trainer:
                                     eval_payload["eval/action_l1"] = float(metrics["action_l1"])
                             self._wandb_log(eval_payload)
 
-                    if self.save_every > 0 and self.global_step % self.save_every == 0:
+                    if (
+                        completed_joint_update
+                        and self.save_every > 0
+                        and self.joint_step % self.save_every == 0
+                    ):
                         ckpt_info = self.save_checkpoint()
                         if self.accelerator.is_main_process:
                             logger.info(

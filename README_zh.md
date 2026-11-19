@@ -11,7 +11,9 @@
 [![Hugging Face Dataset - LIBERO](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset%20LIBERO-f7c843)](https://huggingface.co/datasets/yuanty/LIBERO-fastwam)
 [![Hugging Face Dataset - RoboTwin](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset%20RoboTwin-f7c843)](https://huggingface.co/datasets/yuanty/robotwin2.0-fastwam)
 
-本仓库包含 FastWAM 在 LIBERO / RoboTwin 上的训练与评估代码。
+本仓库包含 FastWAM 在 LIBERO / RoboTwin 上的训练与评估代码，以及使用同一
+OpenTouch 数据划分的无触觉二专家 baseline 和触觉三专家实验；命令见
+[docs/opentouch_force.md](docs/opentouch_force.md)。
 
 ## What's New
 

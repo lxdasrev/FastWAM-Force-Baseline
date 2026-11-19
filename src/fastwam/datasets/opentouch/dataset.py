@@ -21,14 +21,14 @@ from .retarget import retarget_hand_sequence
 from .contract import write_artifacts, verify_artifact_payloads
 
 
-class OpenTouchForceDataset(Dataset):
+class OpenTouchDataset(Dataset):
     """FastWAM windows built directly from OpenTouch raw HDF5 files.
 
     Numeric retargeting is cached per episode. RGB JPEG frames remain in the
     source HDF5 and are decoded only for the nine frames used by FastWAM.
     """
 
-    PROCESSING_VERSION = 3
+    PROCESSING_VERSION = 4
     DATA_CONTRACT_VERSION = 1
 
     def __init__(
@@ -53,10 +53,11 @@ class OpenTouchForceDataset(Dataset):
         compute_force_stats: bool = True,
         normalize_action_proprio: bool = True,
         strict_schema: bool = True,
-        prompt_template: str = "Manipulate the object using visual and tactile feedback: {task}",
+        prompt_template: str = "Manipulate the object: {task}",
         sample_rate_hz: float = 30.0,
         gripper_closed_ratio: float = 0.18,
         gripper_open_ratio: float = 1.35,
+        include_force: bool = True,
     ) -> None:
         super().__init__()
         if split not in {"train", "val", "test"}:
@@ -91,20 +92,25 @@ class OpenTouchForceDataset(Dataset):
         self.sample_rate_hz = float(sample_rate_hz)
         self.gripper_closed_ratio = float(gripper_closed_ratio)
         self.gripper_open_ratio = float(gripper_open_ratio)
+        self.include_force = bool(include_force)
 
-        asset = Path(__file__).with_name("assets") / "fingertip_taxels.json"
-        self.taxel_mask_path = asset
-        self.taxel_mask_sha256 = hashlib.sha256(asset.read_bytes()).hexdigest()
-        spec = json.loads(asset.read_text(encoding="utf-8"))
-        names = list(spec["finger_names"])
-        if names[:2] != ["thumb", "index"]:
-            raise ValueError(f"Unexpected finger order in {asset}: {names}")
-        weights = np.zeros((len(names), 16, 16), dtype=np.float32)
-        for finger_idx, name in enumerate(names):
-            for row, col in spec["right_pressure_taxels"][name]:
-                weights[finger_idx, row, col] = 1.0
-        counts = weights.sum(axis=(1, 2))
-        self.finger_weights = (weights / counts[:, None, None]).reshape(len(names), 256)
+        self.taxel_mask_path: Path | None = None
+        self.taxel_mask_sha256: str | None = None
+        self.finger_weights: np.ndarray | None = None
+        if self.include_force:
+            asset = Path(__file__).with_name("assets") / "fingertip_taxels.json"
+            self.taxel_mask_path = asset
+            self.taxel_mask_sha256 = hashlib.sha256(asset.read_bytes()).hexdigest()
+            spec = json.loads(asset.read_text(encoding="utf-8"))
+            names = list(spec["finger_names"])
+            if names[:2] != ["thumb", "index"]:
+                raise ValueError(f"Unexpected finger order in {asset}: {names}")
+            weights = np.zeros((len(names), 16, 16), dtype=np.float32)
+            for finger_idx, name in enumerate(names):
+                for row, col in spec["right_pressure_taxels"][name]:
+                    weights[finger_idx, row, col] = 1.0
+            counts = weights.sum(axis=(1, 2))
+            self.finger_weights = (weights / counts[:, None, None]).reshape(len(names), 256)
 
         files = sorted(self.raw_data_root.glob("*.hdf5"))
         if not files:
@@ -127,7 +133,9 @@ class OpenTouchForceDataset(Dataset):
         }
         self.episodes: list[tuple[Path, str, int]] = []
         all_episodes: list[tuple[Path, str, int]] = []
-        required = {"right_pressure", "right_hand_landmarks"}
+        required = {"right_hand_landmarks"}
+        if self.include_force:
+            required.add("right_pressure")
         for path in files:
             with h5py.File(path, "r") as handle:
                 if "data" not in handle:
@@ -145,7 +153,9 @@ class OpenTouchForceDataset(Dataset):
                             )
                         continue
                     frames = int(demo["right_hand_landmarks"].shape[0])
-                    aligned_keys = ["right_pressure", image_key]
+                    aligned_keys = [image_key]
+                    if self.include_force:
+                        aligned_keys.append("right_pressure")
                     mismatched = [key for key in aligned_keys if int(demo[key].shape[0]) != frames]
                     if mismatched:
                         if self.strict_schema:
@@ -157,7 +167,13 @@ class OpenTouchForceDataset(Dataset):
                         all_episodes.append((path, demo_name, frames))
         self._all_episodes = all_episodes
         self.episodes = [ep for ep in all_episodes if self._group_split(ep[0].stem) == self.split]
-        self.force_median, self.force_scale = self._load_or_compute_force_stats(compute_force_stats)
+        if self.include_force:
+            self.force_median, self.force_scale = self._load_or_compute_force_stats(
+                compute_force_stats
+            )
+        else:
+            self.force_median = None
+            self.force_scale = None
         (
             self.action_mean,
             self.action_scale,
@@ -185,6 +201,8 @@ class OpenTouchForceDataset(Dataset):
         return None
 
     def _pressure_to_two_finger(self, raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if not self.include_force or self.finger_weights is None:
+            raise RuntimeError("Force processing is disabled for this OpenTouch dataset.")
         raw = np.asarray(raw, dtype=np.float32)
         if raw.ndim != 3 or raw.shape[1:] != (16, 16):
             raise ValueError(f"Expected pressure [T,16,16], got {raw.shape}")
@@ -247,10 +265,14 @@ class OpenTouchForceDataset(Dataset):
             f"{self.workspace_scale_m}:{self.smoothing_window}:"
             f"{self.max_delta_translation_m}:{self.max_delta_rotation_rad}:"
             f"{self.PROCESSING_VERSION}:{self.gripper_closed_ratio}:{self.gripper_open_ratio}:"
-            f"{self.pressure_baseline}:{self.force_deadzone}:{self.force_asinh_scale}:{self.force_clip}:"
-            f"{self.taxel_mask_sha256}:"
-            f"{self.force_median.tolist()}:{self.force_scale.tolist()}"
+            f"include_force={self.include_force}"
         )
+        if self.include_force:
+            signature += (
+                f":{self.pressure_baseline}:{self.force_deadzone}:{self.force_asinh_scale}:"
+                f"{self.force_clip}:{self.taxel_mask_sha256}:"
+                f"{self.force_median.tolist()}:{self.force_scale.tolist()}"
+            )
         digest = hashlib.sha256(signature.encode()).hexdigest()
         return self.cache_root / "episodes" / f"{digest}.npz"
 
@@ -345,20 +367,22 @@ class OpenTouchForceDataset(Dataset):
             retargeted["action_valid"] &= (
                 np.linalg.norm(retargeted["action"][:, 3:6], axis=1) <= self.max_delta_rotation_rad
             )
-            force, force_valid = self._pressure_to_two_finger(demo["right_pressure"][()])
-        force = np.clip(
-            (force - self.force_median[None]) / self.force_scale[None],
-            -self.force_clip,
-            self.force_clip,
-        ).astype(np.float32)
+            if self.include_force:
+                force, force_valid = self._pressure_to_two_finger(demo["right_pressure"][()])
         payload = {
             "action": retargeted["action"],
             "action_valid": retargeted["action_valid"],
             "proprio": retargeted["proprio"],
             "pose_valid": retargeted["pose_valid"],
-            "force": force,
-            "force_valid": force_valid,
         }
+        if self.include_force:
+            force = np.clip(
+                (force - self.force_median[None]) / self.force_scale[None],
+                -self.force_clip,
+                self.force_clip,
+            ).astype(np.float32)
+            payload["force"] = force
+            payload["force_valid"] = force_valid
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = cache_path.with_name(f"{cache_path.stem}.{os.getpid()}.npz")
         np.savez_compressed(tmp_path, **payload)
@@ -400,6 +424,8 @@ class OpenTouchForceDataset(Dataset):
 
     def find_contact_window(self, start_index: int = 0) -> int:
         """Return a deterministic validation window with observed valid contact."""
+        if not self.include_force:
+            raise RuntimeError("Contact-window search requires include_force=True.")
         start_index = int(start_index) % len(self.windows)
         if start_index in self._contact_window_cache:
             return self._contact_window_cache[start_index]
@@ -419,6 +445,8 @@ class OpenTouchForceDataset(Dataset):
         return start_index
 
     def normalize_force(self, force: np.ndarray) -> np.ndarray:
+        if not self.include_force:
+            raise RuntimeError("Force normalization requires include_force=True.")
         transformed = np.arcsinh(
             np.maximum(np.asarray(force, dtype=np.float32) - self.force_deadzone, 0.0)
             / self.force_asinh_scale
@@ -430,6 +458,8 @@ class OpenTouchForceDataset(Dataset):
         ).astype(np.float32)
 
     def denormalize_force(self, normalized_force: np.ndarray) -> np.ndarray:
+        if not self.include_force:
+            raise RuntimeError("Force denormalization requires include_force=True.")
         transformed = np.asarray(normalized_force, dtype=np.float32) * self.force_scale + self.force_median
         relative = np.maximum(np.sinh(transformed) * self.force_asinh_scale, 0.0)
         return (relative + self.force_deadzone).astype(np.float32)
@@ -511,25 +541,28 @@ class OpenTouchForceDataset(Dataset):
         return records
 
     def normalization_payload(self) -> dict[str, np.ndarray]:
-        return {
+        payload = {
             "action_mean": self.action_mean.astype(np.float32),
             "action_scale": self.action_scale.astype(np.float32),
             "proprio_mean": self.proprio_mean.astype(np.float32),
             "proprio_scale": self.proprio_scale.astype(np.float32),
-            "force_median": self.force_median.astype(np.float32),
-            "force_scale": self.force_scale.astype(np.float32),
         }
+        if self.include_force:
+            payload["force_median"] = self.force_median.astype(np.float32)
+            payload["force_scale"] = self.force_scale.astype(np.float32)
+        return payload
 
     def data_contract_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": self.DATA_CONTRACT_VERSION,
             "processing_version": self.PROCESSING_VERSION,
+            "experiment_mode": "force" if self.include_force else "baseline",
             "code_commit": self._git_commit(),
             "sample_rate_hz": self.sample_rate_hz,
             "timeline": {
                 "video_offsets": self.video_indices,
-                "force_offsets": list(range(-self.history_steps, self.future_steps + 1)),
                 "action_offsets": list(range(1, self.future_steps + 1)),
+                "anchor_history_steps": self.history_steps,
             },
             "coordinate_system": {
                 "name": "sequence_initial_palm_canonical_frame",
@@ -562,15 +595,6 @@ class OpenTouchForceDataset(Dataset):
                 ],
                 "note": "Only dimensions 0:6 are deltas; dimension 6 is an absolute next target.",
             },
-            "force": {
-                "shape": [self.total_force_steps, 2],
-                "finger_order": ["thumb", "index"],
-                "pressure_baseline": self.pressure_baseline,
-                "deadzone": self.force_deadzone,
-                "asinh_scale": self.force_asinh_scale,
-                "normalized_clip": self.force_clip,
-                "taxel_mask_sha256": self.taxel_mask_sha256,
-            },
             "retarget": {
                 "workspace_scale_m": self.workspace_scale_m,
                 "smoothing_window": self.smoothing_window,
@@ -580,6 +604,20 @@ class OpenTouchForceDataset(Dataset):
                 "max_delta_rotation_rad": self.max_delta_rotation_rad,
             },
         }
+        if self.include_force:
+            payload["timeline"]["force_offsets"] = list(
+                range(-self.history_steps, self.future_steps + 1)
+            )
+            payload["force"] = {
+                "shape": [self.total_force_steps, 2],
+                "finger_order": ["thumb", "index"],
+                "pressure_baseline": self.pressure_baseline,
+                "deadzone": self.force_deadzone,
+                "asinh_scale": self.force_asinh_scale,
+                "normalized_clip": self.force_clip,
+                "taxel_mask_sha256": self.taxel_mask_sha256,
+            }
+        return payload
 
     def split_manifest_payload(self) -> dict[str, Any]:
         episode_records = [
@@ -618,29 +656,48 @@ class OpenTouchForceDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         source, demo_name, anchor = self.windows[index]
         episode = self._load_numeric_episode(source, demo_name)
-        force_start = anchor - self.history_steps
-        force_stop = anchor + self.future_steps + 1
         video_indices = [anchor + offset for offset in self.video_indices]
         action = episode["action"][anchor : anchor + self.future_steps]
         action_valid = episode["action_valid"][anchor : anchor + self.future_steps]
-        force = episode["force"][force_start:force_stop]
-        force_valid = episode["force_valid"][force_start:force_stop]
-        if action.shape != (self.future_steps, 7) or force.shape != (self.total_force_steps, 2):
+        if action.shape != (self.future_steps, 7):
             raise RuntimeError("Internal OpenTouch window alignment failure.")
         task = f"{source.stem} {demo_name}".replace("_", " ")
         action = ((action - self.action_mean) / self.action_scale).astype(np.float32)
         proprio = (
             (episode["proprio"][anchor : anchor + 1] - self.proprio_mean) / self.proprio_scale
         ).astype(np.float32)
-        return {
+        sample = {
             "video": self._load_video(source, demo_name, video_indices),
             "action": torch.from_numpy(action),
             "proprio": torch.from_numpy(proprio),
-            "force": torch.from_numpy(force),
-            "force_valid": torch.from_numpy(force_valid),
-            "force_is_pad": torch.zeros(self.total_force_steps, dtype=torch.bool),
             "image_is_pad": torch.zeros(len(self.video_indices), dtype=torch.bool),
             "action_is_pad": torch.from_numpy(~action_valid),
             "proprio_is_pad": torch.tensor([not bool(episode["pose_valid"][anchor])]),
             "prompt": self.prompt_template.format(task=task),
         }
+        if self.include_force:
+            force_start = anchor - self.history_steps
+            force_stop = anchor + self.future_steps + 1
+            force = episode["force"][force_start:force_stop]
+            force_valid = episode["force_valid"][force_start:force_stop]
+            if force.shape != (self.total_force_steps, 2):
+                raise RuntimeError("Internal OpenTouch force-window alignment failure.")
+            sample.update(
+                {
+                    "force": torch.from_numpy(force),
+                    "force_valid": torch.from_numpy(force_valid),
+                    "force_is_pad": torch.zeros(self.total_force_steps, dtype=torch.bool),
+                }
+            )
+        return sample
+
+
+class OpenTouchForceDataset(OpenTouchDataset):
+    """Backward-compatible force-enabled OpenTouch dataset name."""
+
+    def __init__(self, *args, include_force: bool = True, **kwargs) -> None:
+        if not include_force:
+            raise ValueError(
+                "OpenTouchForceDataset always enables force; use OpenTouchDataset(include_force=False)."
+            )
+        super().__init__(*args, include_force=True, **kwargs)
