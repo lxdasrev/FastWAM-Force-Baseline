@@ -8,6 +8,34 @@ from fastwam.models.wan22.mot import MoT
 from fastwam.models.wan22.wan_video_dit import precompute_freqs_cis
 
 
+def _first_frame_causal_video_mask(**kwargs) -> torch.Tensor:
+    video_seq_len = kwargs["video_seq_len"]
+    first_frame_tokens = min(kwargs["video_tokens_per_frame"], video_seq_len)
+    mask = torch.ones(
+        video_seq_len,
+        video_seq_len,
+        dtype=torch.bool,
+        device=kwargs["device"],
+    )
+    mask[:first_frame_tokens, first_frame_tokens:] = False
+    return mask
+
+
+def _mask_builder_dummy(
+    *, observed_steps: int = 2, total_steps: int = 3, num_fingers: int = 2
+):
+    return SimpleNamespace(
+        force_expert=SimpleNamespace(
+            observed_steps=observed_steps,
+            total_steps=total_steps,
+            num_fingers=num_fingers,
+        ),
+        video_expert=SimpleNamespace(
+            build_video_to_video_mask=_first_frame_causal_video_mask,
+        ),
+    )
+
+
 def _tiny_force_block() -> ForceBlock:
     torch.manual_seed(1)
     return ForceBlock(
@@ -65,14 +93,7 @@ def test_all_invalid_force_rows_are_zero_and_finite():
 
 
 def test_force_mot_mask_removes_invalid_force_keys_and_has_no_empty_rows():
-    dummy = SimpleNamespace(
-        force_expert=SimpleNamespace(observed_steps=2, total_steps=3, num_fingers=2),
-        video_expert=SimpleNamespace(
-            build_video_to_video_mask=lambda **kwargs: torch.ones(
-                kwargs["video_seq_len"], kwargs["video_seq_len"], dtype=torch.bool
-            )
-        ),
-    )
+    dummy = _mask_builder_dummy()
     valid = torch.tensor([[[1, 0], [0, 0], [1, 0]]], dtype=torch.bool)
     mask = FastWAM._build_force_mot_attention_mask(
         dummy,
@@ -85,6 +106,74 @@ def test_force_mot_mask_removes_invalid_force_keys_and_has_no_empty_rows():
     force_columns = mask[0, 0, :, 2:8]
     assert torch.equal(force_columns.any(dim=0), valid.flatten())
     assert mask.any(dim=-1).all()
+
+
+def test_force_mot_mask_matches_v0_vplus_f0_fplus_action_contract():
+    dummy = _mask_builder_dummy()
+    mask = FastWAM._build_force_mot_attention_mask(
+        dummy,
+        video_seq_len=4,
+        action_seq_len=3,
+        video_tokens_per_frame=2,
+        device=torch.device("cpu"),
+    )
+
+    partitions = {
+        "V0": slice(0, 2),
+        "V+": slice(2, 4),
+        "F0": slice(4, 8),
+        "F+": slice(8, 10),
+        "A": slice(10, 13),
+    }
+    expected = {
+        "V0": {"V0"},
+        "V+": {"V0", "V+"},
+        "F0": {"V0", "F0"},
+        "F+": {"V0", "F0", "F+"},
+        "A": {"V0", "F0", "F+", "A"},
+    }
+    for query_name, query_slice in partitions.items():
+        for key_name, key_slice in partitions.items():
+            block = mask[query_slice, key_slice]
+            if key_name in expected[query_name]:
+                assert block.all(), f"Expected {query_name} -> {key_name}: {block}"
+            else:
+                assert not block.any(), f"Unexpected {query_name} -> {key_name}: {block}"
+
+    assert not mask[partitions["F+"], partitions["A"]].any()
+    assert mask[partitions["A"], partitions["F+"]].all()
+
+
+def test_all_invalid_force_keys_are_removed_without_empty_attention_rows():
+    dummy = _mask_builder_dummy()
+    invalid = torch.zeros(2, 3, 2, dtype=torch.bool)
+    mask = FastWAM._build_force_mot_attention_mask(
+        dummy,
+        video_seq_len=4,
+        action_seq_len=3,
+        video_tokens_per_frame=2,
+        device=torch.device("cpu"),
+        force_valid=invalid,
+    )
+    assert not mask[..., 4:10].any()
+    assert mask.any(dim=-1).all()
+
+
+def test_two_expert_mot_mask_contract_is_unchanged():
+    dummy = _mask_builder_dummy()
+    mask = FastWAM._build_mot_attention_mask(
+        dummy,
+        video_seq_len=4,
+        action_seq_len=3,
+        video_tokens_per_frame=2,
+        device=torch.device("cpu"),
+    )
+    expected = torch.zeros(7, 7, dtype=torch.bool)
+    expected[:2, :2] = True
+    expected[2:4, :4] = True
+    expected[4:, :2] = True
+    expected[4:, 4:] = True
+    assert torch.equal(mask, expected)
 
 
 def test_force_flow_loss_is_per_sample_scheduler_weighted():

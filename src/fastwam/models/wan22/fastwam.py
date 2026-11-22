@@ -687,9 +687,10 @@ class FastWAM(torch.nn.Module):
         # F0 -> V0,F0.
         mask[force_start:force_future_start, :first_frame_tokens] = True
         mask[force_start:force_future_start, force_start:force_future_start] = True
-        # F+ -> V0,F0,F+,A.
+        # F+ -> V0,F0,F+.  Future force must not read action tokens; action
+        # remains downstream and may still read both observed and future force.
         mask[force_future_start:action_start, :first_frame_tokens] = True
-        mask[force_future_start:action_start, force_start:total] = True
+        mask[force_future_start:action_start, force_start:action_start] = True
         # A -> V0,F0,F+,A.
         mask[action_start:, :first_frame_tokens] = True
         mask[action_start:, force_start:total] = True
